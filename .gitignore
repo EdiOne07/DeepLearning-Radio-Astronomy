@@ -1,0 +1,70 @@
+# ==========================================
+# Datasets & Large Binary Files (OSKAR / Radio Astronomy)
+# ==========================================
+*.vis
+*.ms
+*.fits
+*.hdf5
+*.h5
+data/
+Datasets/
+bench_data.vis
+
+# ==========================================
+# Machine Learning & PyTorch Checkpoints
+# ==========================================
+*.pt
+*.pth
+*.ckpt
+*.onnx
+*.safetensors
+runs/
+wandb/
+tb_logs/
+checkpoints/
+
+# ==========================================
+# Python & Virtual Environments
+# ==========================================
+.venv/
+venv/
+env/
+ENV/
+__pycache__/
+*.py[cod]
+*$py.class
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# ==========================================
+# C++ Extensions & Build Artifacts (rat-stack)
+# ==========================================
+build/
+dist/
+*.egg-info/
+*.so
+*.o
+*.a
+*.dylib
+*.dll
+csrc/*.so
+
+# ==========================================
+# Nix & Direnv
+# ==========================================
+.direnv/
+result
+result-*
+
+# ==========================================
+# IDE & System Files
+# ==========================================
+.vscode/
+!.vscode/settings.json
+!.vscode/tasks.json
+!.vscode/launch.json
+.idea/
+*.swp
+*~
+.DS_Store
