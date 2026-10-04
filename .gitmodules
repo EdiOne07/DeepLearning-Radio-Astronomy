@@ -1,0 +1,3 @@
+[submodule "Scripts_for_Interpreting_Data/rat-stack"]
+	path = Scripts_for_Interpreting_Data/rat-stack
+	url = https://gitlab.com/phdenzel/rat-stack.git
