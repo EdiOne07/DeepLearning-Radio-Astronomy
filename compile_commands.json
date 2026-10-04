@@ -1,0 +1,17 @@
+[
+  {
+    "directory": "/home/edione/Projects/DeepLearning-Radio-Astronomy",
+    "file": "/home/edione/Projects/DeepLearning-Radio-Astronomy/csrc/vis_reader.cpp",
+    "arguments": [
+      "clang++",
+      "-std=c++17",
+      "-xc++",
+      "-I/nix/store/yp40prwdgp6b1wlpyjpcmibrbz7hqydy-oskar-2.12.3-dev/include",
+      "-I/nix/store/yp40prwdgp6b1wlpyjpcmibrbz7hqydy-oskar-2.12.3-dev/include/oskar",
+      "-I/nix/store/60m4rxhg2fldqaak400c0lry96ijrzqn-python3-3.13.13/include/python3.13",
+      "-I/nix/store/js9am9k26yhv887r63ka93d8xaxk0if3-python3.13-pybind11-3.0.4/include",
+      "-I/nix/store/n678a91as05dls78hghfcqygjq7s5h31-python3.13-torch-2.12.0/lib/python3.13/site-packages/torch/include",
+      "-I/nix/store/n678a91as05dls78hghfcqygjq7s5h31-python3.13-torch-2.12.0/lib/python3.13/site-packages/torch/include/torch/csrc/api/include"
+    ]
+  }
+]

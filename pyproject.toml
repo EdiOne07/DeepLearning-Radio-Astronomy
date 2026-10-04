@@ -1,0 +1,39 @@
+[project]
+name = "deep-learning-radio-astronomy"
+version = "0.1.0"
+requires-python = ">=3.10"
+dependencies = [
+    "torch",
+    "astroplan",
+    "rat-stack",
+]
+
+[tool.uv]
+python-preference = "only-system"
+
+# Format override-dependencies as a list of strings
+override-dependencies = [
+    "astroplan==0.10",
+]
+
+[tool.uv.sources]
+rat-stack = { path = "Scripts_for_Interpreting_Data/rat-stack", editable = true }
+
+# Point astroplan directly to the official repository tag
+astroplan = { git = "https://github.com/astropy/astroplan.git", tag = "v0.10" }
+
+# Git sources for SKA tools
+dp3 = { git = "https://gitlab.com/phdenzel/dp3.git" }
+oskarpy = { git = "https://gitlab.com/phdenzel/oskar.git", subdirectory = "python" }
+ska-ost-array-config = { git = "https://gitlab.com/phdenzel/ska-ost-array-config.git" }
+ska-sdp-func-python = { git = "https://gitlab.com/phdenzel/ska-sdp-func-python.git", tag = "1.0.3" }
+ska-sdp-datamodels = { git = "https://gitlab.com/phdenzel/ska-sdp-datamodels.git", tag = "1.1.0" }
+ska-telmodel = { git = "https://gitlab.com/phdenzel/ska-telmodel.git" }
+ska-telmodel-client = { git = "https://gitlab.com/phdenzel/ska-telmodel-client.git" }
+ska-schemas = { git = "https://gitlab.com/phdenzel/ska-schemas.git" }
+
+[tool.uv.extra-build-dependencies]
+rat-stack = ["hatchling", "setuptools", "editables", "torch"]
+astropy = ["extension_helpers"]
+ska-sdp-func-python = ["poetry"]
+numpy = ["meson-python"]
