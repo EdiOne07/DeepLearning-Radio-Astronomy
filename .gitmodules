@@ -1,3 +1,6 @@
 [submodule "Scripts_for_Interpreting_Data/rat-stack"]
 	path = Scripts_for_Interpreting_Data/rat-stack
 	url = https://gitlab.com/phdenzel/rat-stack.git
+[submodule "chuchichaestli"]
+	path = chuchichaestli
+	url = https://github.com/CAIIVS/chuchichaestli.git

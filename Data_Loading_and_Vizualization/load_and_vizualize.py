@@ -102,14 +102,11 @@ def plot_fourier_space(u, v, visibilities, title="Fourier Space Sampling (UV Pla
     plt.xlabel("u [wavelengths / meters]")
     plt.ylabel("v [wavelengths / meters]")
     plt.grid(True, linestyle=":", alpha=0.4)
-    plt.axis("equal")  # Keep aspect ratio square for spatial frequencies
+    plt.axis("equal")
 
     plt.tight_layout()
     plt.savefig("fourier_space_uv.png", dpi=300)
     plt.show()
-
-   
-
 
 if __name__ == "__main__":
     args = sys.argv[1:]
