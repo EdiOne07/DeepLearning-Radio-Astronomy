@@ -13,7 +13,8 @@ from torch.utils.data import DataLoader
 from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
 from rat_stack import TimeSlicedVisDataset
-import Data_Gridding
+from Data_Gridding_Amplitude_Phase import UVDataGridding_Phase
+from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase
 
 from enum import Enum
 
@@ -28,7 +29,7 @@ from chuchichaestli.models.autoencoder import Autoencoder
 ###################
 # CONFIGURATION
 ###################
-WINDOW_SIZE=8
+WINDOW_SIZE=1
 TARGET_SIZE=1
 STRIDE=1
 EPOCHS=30
@@ -40,6 +41,7 @@ MAX_UV=70000
 BLOCK_SIZE = 32
 HOLDOUT_RATIO = 0.20
 SEED=42
+AMPLITUDE_SCALE=0.1
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -51,7 +53,7 @@ class Model_Type(Enum):
 # DATA_HANDLING
 ###################
 
-transform=Data_Gridding(GRID_SIZE,MAX_UV)
+transform=UVDataGridding_Phase(GRID_SIZE,MAX_UV,AMPLITUDE_SCALE)
 
 class TransformDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, transform):
@@ -227,5 +229,90 @@ def train_one_fold(
     print("Training observations:", train_paths)
     print("Validation observation:", val_paths)
     print("=" * 70)
-     
-     
+
+
+
+
+###################
+# TESTING FUNCTIONS
+###################
+def check_model_functionalities(path:list[str]):
+    model=makeModel(device=device,model_type=Model_Type.AUTOENCODER_BASE)
+    model.eval()
+    data=makeDataset(paths,use_cuda=use_cuda)
+    sample=data[1]
+    x=sample["input_grid"].unsqueeze(0).to(device)
+    print("Input shape:",x.shape)
+    print("\n")
+    with torch.no_grad():
+        latent=model.encode(x)
+        print("Latent type:", type(latent))
+        print("Latent shape:", getattr(latent, "shape", None))
+        if not isinstance(latent, torch.Tensor):
+            raise TypeError(
+                "Inspect the encode() return value before decoding."
+        )
+        reconstruct=model.decode(latent)
+        direct_output=model(x)
+    print("Input:", x.shape)
+    print("Latent:", latent.shape)
+    print("Reconstructed:", reconstruct.shape)
+
+    assert reconstruct.shape == (1, 2, 256, 256)
+    assert direct_output.shape == reconstruct.shape
+
+    difference = (
+        direct_output - reconstruct
+    ).abs().max().item()
+
+    print("Maximum forward/decode difference:", difference)
+
+    original = sample["target_grid"]
+
+    original_bytes = original.numel() * original.element_size()
+    latent_bytes = latent.numel() * latent.element_size()
+
+    print(
+        "Tensor-size ratio:",
+        original_bytes / latent_bytes
+    )
+
+#Loss testing funciton for MSE_Loss_Amplitude_Phase
+def test_loss(path:list[str]):
+    data=makeDataset(paths,use_cuda=use_cuda)
+    criterion = MSELoss_Amplitude_Phase(
+    amplitude_scale=data.transform.amplitude_scale
+)
+
+    sample = data[0]
+
+    input_grid = sample["input_grid"].unsqueeze(0)
+    target = sample["target_grid"].unsqueeze(0)
+
+    mask = input_grid[:, 2:3]
+
+    perfect_output = input_grid[:, 0:2]
+
+    loss = criterion(perfect_output, target, mask)
+
+    print("Perfect reconstruction loss:", loss.item())
+
+    wrong_output = perfect_output.clone()
+    wrong_output[:, 1] += 0.5
+
+    wrong_loss = criterion(wrong_output, target, mask)
+
+    print("Wrong reconstruction loss:", wrong_loss.item())
+
+    assert wrong_loss > loss
+    
+if __name__ == "__main__":
+    args = sys.argv[1:]
+
+    paths = sorted({
+        str(Path(p).resolve())
+        for arg in args
+        for p in (glob.glob(arg) or [arg])
+        if Path(p).is_file()
+    })
+    test_loss(path=paths)
