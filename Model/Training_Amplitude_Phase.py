@@ -3,6 +3,7 @@ import sys
 import glob
 import copy
 from pathlib import Path
+import math
 
 import torch
 import torch.nn as nn
@@ -14,7 +15,7 @@ from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
 from rat_stack import TimeSlicedVisDataset
 from Data_Gridding_Amplitude_Phase import UVDataGridding_Phase
-from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase
+from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase,polar_to_cartesian
 
 from enum import Enum
 
@@ -32,7 +33,8 @@ from chuchichaestli.models.autoencoder import Autoencoder
 WINDOW_SIZE=1
 TARGET_SIZE=1
 STRIDE=1
-EPOCHS=30
+BATCH_SIZE=16
+EPOCHS=5
 LEARNING_RATE=1e-3
 LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=5
@@ -42,6 +44,8 @@ BLOCK_SIZE = 32
 HOLDOUT_RATIO = 0.20
 SEED=42
 AMPLITUDE_SCALE=0.1
+WEIGHT_DECAY = 1e-4
+
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 
@@ -61,7 +65,7 @@ class TransformDataset(torch.utils.data.Dataset):
         self.transform=transform
     def __getitem__(self, index):
         item=self.dataset[index]
-        return self.transform(self.dataset[index])
+        return self.transform(item)
     def __len__(self):
         return len(self.dataset)
 
@@ -91,7 +95,7 @@ def makeModel(device,model_type:Model_Type):
                 res_norm_type="group",
                 encoder_args={"n_channels": 16},
             ).to(device)
-    elif Model_Type==Model_Type.FUTURE_AUTOENCODER:
+    elif model_type==Model_Type.FUTURE_AUTOENCODER:
         # tbd
         return 0
 
@@ -157,66 +161,62 @@ def make_model_and_input_target(grid,heldout_mask):
 @torch.no_grad()
 def validate_model(model,val_loader,criterion,device):
     model.eval()
-
-    masker=make_spatial_masker()
-
     total_error = 0.0
     total_power = 0.0
-    total_loss = 0.0
-    total_batches = 0
-    total_hidden_cells = 0
-
-    mask_generator = torch.Generator(device="cpu")
-    mask_generator.manual_seed(SEED + 1000)
+    total_observed = 0.0
 
     for batch in val_loader:
-        grid_data=batch["input_grid"].to(device)
-        original_mask=grid_data[:,2:3,:,:]
+        input_grid=batch["input_grid"].to(device)
+        target_grid=batch["target_grid"].to(device)
+        occupancy_mask=input_grid[:,2:3,:,:]
 
-        _,heldout_mask=masker.train_validation_split(mask=original_mask,generator=mask_generator)
-        model_input,loss_target,_=make_model_and_input_target(grid=grid_data,heldout_mask=heldout_mask)
 
-        output=model(model_input)
-        loss=criterion(output,loss_target)
+        output=model(input_grid)
+        prediction=polar_to_cartesian(output,amplitude_scale=criterion.amplitude_scale)
+        squared_error = (
+            (prediction - target_grid)
+            .square()
+            .sum(dim=1, keepdim=True)
+        )
+        target_power = (
+            target_grid
+            .square()
+            .sum(dim=1, keepdim=True)
+        )
+        total_error += (
+            squared_error * occupancy_mask
+        ).sum().item()
 
-        target=grid_data[:,0:2,:,:]
-        expanded_mask = heldout_mask.expand_as(target)
+        total_power += (
+            target_power * occupancy_mask
+        ).sum().item()
 
-        error = (
-                    (output - target).square() * expanded_mask
-                ).sum()
-        
-        power = (
-                    target.square() * expanded_mask
-                ).sum()
-        
-        total_error += error.item()
-        total_power += power.item()
-        total_loss += loss.item()
-        total_batches += 1
-        total_hidden_cells += int(heldout_mask.sum().item())
-        
-    if total_hidden_cells == 0:
-                raise RuntimeError(
-                    "Validation has zero held-out observed cells. "
-                    "Check the occupancy mask and spatial split."
-                )
-        
-    nmse = total_error / max(total_power, 1e-8)
-    snr_db = 10.0 * torch.log10(
-                torch.tensor(
-                    total_power / max(total_error, 1e-8)
-                )
-            ).item()
-        
-    avg_loss = total_loss / max(total_batches, 1)
-        
-    return avg_loss, nmse, snr_db
-        
+        total_observed += occupancy_mask.sum().item()
+
+    if total_observed == 0:
+        raise RuntimeError(
+            "Validation contains no observed UV cells."
+        )
+    val_loss = total_error / total_observed
+    if total_power <= 0:
+        raise RuntimeError(
+            "Validation target has zero signal power."
+        )
+
+    nmse = total_error / total_power
+
+    snr_db = (
+        -10.0 * math.log10(nmse)
+        if nmse > 0
+        else float("inf")
+    )
+
+    return val_loss, nmse, snr_db
+
+
 ###################
-# TRAINING_ONE_EPOCH
+# TRAIN ONE FOLD
 ###################
-
 def train_one_fold(
     fold_number,
     train_paths,
@@ -230,8 +230,261 @@ def train_one_fold(
     print("Validation observation:", val_paths)
     print("=" * 70)
 
+    use_cuda = device.type == "cuda"
+
+    train_dataset = makeDataset(train_paths, use_cuda)
+    val_dataset = makeDataset(val_paths, use_cuda)
+
+    if len(train_dataset) == 0 or len(val_dataset) == 0:
+        raise RuntimeError(
+            f"Fold {fold_number} has an empty dataset. "
+            "Check file paths and time-window settings."
+        )
+
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=2,
+        pin_memory=False,
+    )
+
+    val_loader = DataLoader(
+        val_dataset,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=2,
+        pin_memory=False,
+    )
+
+    model = makeModel(device,Model_Type.AUTOENCODER_BASE)
+
+    criterion = MSELoss_Amplitude_Phase(
+        amplitude_scale=transform.amplitude_scale
+    )
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=LEARNING_RATE,
+        weight_decay=WEIGHT_DECAY,
+    )
+
+    best_nmse = float("inf")
+    best_snr = float("-inf")
+    best_state = None
+    history = {
+        "train_loss": [],
+        "val_loss": [],
+        "val_nmse": [],
+        "val_snr": [],
+    }
+
+    for epoch in range(EPOCHS):
+        model.train()
+
+        total_train_loss = 0.0
+        total_train_batches = 0
+
+        for batch in train_loader:
+            input_grid = batch["input_grid"].to(device)
+            target_grid=batch["target_grid"].to(device)
+            original_mask = input_grid[:, 2:3, :, :]
+
+            optimizer.zero_grad()
+
+            outputs = model(input_grid)
+            loss = criterion(outputs, target_grid,original_mask)
+
+            loss.backward()
+            optimizer.step()
+
+            total_train_loss += loss.item()
+            total_train_batches += 1
+
+        avg_train_loss = (
+            total_train_loss / max(total_train_batches, 1)
+        )
+
+        val_loss, val_nmse, val_snr = validate_model(
+            model,
+            val_loader,
+            criterion,
+            device,
+        )
+
+        history["train_loss"].append(avg_train_loss)
+        history["val_loss"].append(val_loss)
+        history["val_nmse"].append(val_nmse)
+        history["val_snr"].append(val_snr)
+
+        print(
+            f"Fold {fold_number}/5 | "
+            f"Epoch {epoch + 1}/{EPOCHS} | "
+            f"Train loss: {avg_train_loss:.6f} | "
+            f"Val loss: {val_loss:.6f} | "
+            f"Val NMSE: {val_nmse:.6f} | "
+            f"Val SNR: {val_snr:.2f} dB"
+        )
+
+ 
+        if val_nmse < best_nmse:
+            best_nmse = val_nmse
+            best_snr = val_snr
+            best_state = copy.deepcopy(model.state_dict())
+
+            checkpoint_path = (
+                output_dir / f"fold_{fold_number}_best.pt"
+            )
+
+            torch.save(
+                {
+                    "fold": fold_number,
+                    "epoch": epoch + 1,
+                    "model_state_dict": best_state,
+                    "best_val_nmse": best_nmse,
+                    "best_val_snr":best_snr,
+                    "val_snr_db": val_snr,
+                    "train_paths": train_paths,
+                    "val_paths": val_paths,
+                },
+                checkpoint_path,
+            )
+
+    if best_state is not None:
+        model.load_state_dict(best_state)
+
+    print(
+        f"\nFold {fold_number} best NMSE: {best_nmse:.6f}"
+    )
+
+    return model, history, best_nmse
 
 
+# ---------------------------------------------------------
+# Five-fold cross-validation
+# ---------------------------------------------------------
+
+def train_model(paths):
+    if len(paths) != 5:
+        raise ValueError(
+            f"Expected 5 independent .vis observations, "
+            f"but received {len(paths)} paths. "
+            "Pass exactly one path per observation."
+        )
+
+    paths = sorted(paths)
+
+    use_cuda = torch.cuda.is_available()
+    device = torch.device("cuda" if use_cuda else "cpu")
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    print("Device:", device)
+    print("Number of observations:", len(paths))
+
+    output_dir = Path("cross_validation_results")
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    fold_results = []
+
+    for val_idx in range(len(paths)):
+        val_paths = [paths[val_idx]]
+        train_paths = [
+            path
+            for idx, path in enumerate(paths)
+            if idx != val_idx
+        ]
+
+        fold_number = val_idx + 1
+
+        _, history, best_nmse = train_one_fold(
+                fold_number=fold_number,
+                train_paths=train_paths,
+                val_paths=val_paths,
+                output_dir=output_dir,
+                device=device,
+            )
+
+        fold_results.append({
+                "fold": fold_number,
+                "validation_path": val_paths[0],
+                "best_nmse": best_nmse,
+                "history": history,
+            })
+
+        scores = torch.tensor(
+            [result["best_nmse"] for result in fold_results],
+            dtype=torch.float64,
+        )
+
+        print("\n" + "=" * 70)
+        print("FIVE-FOLD CROSS-VALIDATION SUMMARY")
+        print("=" * 70)
+
+        for result in fold_results:
+            print(
+                f"Fold {result['fold']}: "
+                f"{result['validation_path']} | "
+                f"Best NMSE: {result['best_nmse']:.6f}"
+            )
+
+        print(f"Mean best NMSE: {scores.mean().item():.6f}")
+        print(f"Std best NMSE:  {scores.std(unbiased=False).item():.6f}")
+        print("=" * 70)
+
+        # Save the aggregate results for later comparison.
+        summary_path = output_dir / "fold_summary.pt"
+        torch.save(
+            [
+                {
+                    "fold": result["fold"],
+                    "validation_path": result["validation_path"],
+                    "best_nmse": result["best_nmse"],
+                }
+                for result in fold_results
+            ],
+            summary_path,
+        )
+
+        # Plot validation performance for all folds.
+        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+
+        for result in fold_results:
+            epochs = range(
+                1, len(result["history"]["val_nmse"]) + 1
+            )
+
+            axes[0].plot(
+                epochs,
+                result["history"]["val_nmse"],
+                label=f"Fold {result['fold']}",
+            )
+
+            axes[1].plot(
+                epochs,
+                result["history"]["val_snr"],
+                label=f"Fold {result['fold']}",
+            )
+
+        axes[0].set_title("Validation NMSE")
+        axes[0].set_xlabel("Epoch")
+        axes[0].set_ylabel("NMSE")
+        axes[0].legend()
+
+        axes[1].set_title("Validation SNR")
+        axes[1].set_xlabel("Epoch")
+        axes[1].set_ylabel("SNR (dB)")
+        axes[1].legend()
+
+        plt.tight_layout()
+        plt.savefig(
+            output_dir / "cross_validation_metrics.png",
+            dpi=300,
+        )
+        plt.show()
+
+        return fold_results
 
 ###################
 # TESTING FUNCTIONS
@@ -307,12 +560,17 @@ def test_loss(path:list[str]):
     assert wrong_loss > loss
     
 if __name__ == "__main__":
-    args = sys.argv[1:]
-
+   
     paths = sorted({
         str(Path(p).resolve())
-        for arg in args
+        for arg in sys.argv[1:]
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    test_loss(path=paths)
+
+    if len(paths) != 5:
+        print(len(paths))
+        raise ValueError("Provide exactly five .vis observations")
+
+    train_model(paths=paths)
+    
