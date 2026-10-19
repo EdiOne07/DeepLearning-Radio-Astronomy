@@ -5,6 +5,11 @@ import copy
 from pathlib import Path
 import math
 
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+if str(PROJECT_ROOT) not in sys.path:
+    sys.path.insert(0, str(PROJECT_ROOT))
+
 import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
@@ -16,7 +21,7 @@ from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if 
 from rat_stack import TimeSlicedVisDataset
 from Data_Gridding_Amplitude_Phase import UVDataGridding_Phase
 from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase,polar_to_cartesian
-
+from Data_Loading_and_Vizualization.ReconstructVisualization import visualize_reconstruction
 from enum import Enum
 
 chuchichaestli_src = Path(
@@ -37,7 +42,7 @@ BATCH_SIZE=16
 EPOCHS=5
 LEARNING_RATE=1e-3
 LAMBDA_SMOOTHNESS=1e-6
-K_FOLDS=5
+K_FOLDS=1
 GRID_SIZE=256
 MAX_UV=70000
 BLOCK_SIZE = 32
@@ -295,6 +300,13 @@ def train_one_fold(
             outputs = model(input_grid)
             loss = criterion(outputs, target_grid,original_mask)
 
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite loss in fold {fold_number}, "
+                    f"epoch {epoch + 1}"
+                )
+
+
             loss.backward()
             optimizer.step()
 
@@ -352,6 +364,15 @@ def train_one_fold(
 
     if best_state is not None:
         model.load_state_dict(best_state)
+        visualize_reconstruction(
+            model=model,
+            dataset=val_dataset,
+            device=device,
+            amplitude_scale=transform.amplitude_scale,
+            output_dir=output_dir,
+            fold_number=fold_number,
+            sample_index=0,
+        )
 
     print(
         f"\nFold {fold_number} best NMSE: {best_nmse:.6f}"
@@ -360,9 +381,9 @@ def train_one_fold(
     return model, history, best_nmse
 
 
-# ---------------------------------------------------------
-# Five-fold cross-validation
-# ---------------------------------------------------------
+############################
+# Five-Fold Cross Validation
+###########################
 
 def train_model(paths):
     if len(paths) != 5:
@@ -388,7 +409,7 @@ def train_model(paths):
 
     fold_results = []
 
-    for val_idx in range(len(paths)):
+    for val_idx in range(K_FOLDS):
         val_paths = [paths[val_idx]]
         train_paths = [
             path
@@ -413,29 +434,28 @@ def train_model(paths):
                 "history": history,
             })
 
-        scores = torch.tensor(
+    scores = torch.tensor(
             [result["best_nmse"] for result in fold_results],
             dtype=torch.float64,
         )
 
-        print("\n" + "=" * 70)
-        print("FIVE-FOLD CROSS-VALIDATION SUMMARY")
-        print("=" * 70)
+    print("\n" + "=" * 70)
+    print("FIVE-FOLD CROSS-VALIDATION SUMMARY")
+    print("=" * 70)
 
-        for result in fold_results:
-            print(
+    for result in fold_results:
+        print(
                 f"Fold {result['fold']}: "
                 f"{result['validation_path']} | "
                 f"Best NMSE: {result['best_nmse']:.6f}"
             )
 
-        print(f"Mean best NMSE: {scores.mean().item():.6f}")
-        print(f"Std best NMSE:  {scores.std(unbiased=False).item():.6f}")
-        print("=" * 70)
+    print(f"Mean best NMSE: {scores.mean().item():.6f}")
+    print(f"Std best NMSE:  {scores.std(unbiased=False).item():.6f}")
+    print("=" * 70)
 
-        # Save the aggregate results for later comparison.
-        summary_path = output_dir / "fold_summary.pt"
-        torch.save(
+    summary_path = output_dir / "fold_summary.pt"
+    torch.save(
             [
                 {
                     "fold": result["fold"],
@@ -447,10 +467,9 @@ def train_model(paths):
             summary_path,
         )
 
-        # Plot validation performance for all folds.
-        fig, axes = plt.subplots(1, 2, figsize=(12, 4))
+    fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
-        for result in fold_results:
+    for result in fold_results:
             epochs = range(
                 1, len(result["history"]["val_nmse"]) + 1
             )
@@ -467,24 +486,24 @@ def train_model(paths):
                 label=f"Fold {result['fold']}",
             )
 
-        axes[0].set_title("Validation NMSE")
-        axes[0].set_xlabel("Epoch")
-        axes[0].set_ylabel("NMSE")
-        axes[0].legend()
+    axes[0].set_title("Validation NMSE")
+    axes[0].set_xlabel("Epoch")
+    axes[0].set_ylabel("NMSE")
+    axes[0].legend()
 
-        axes[1].set_title("Validation SNR")
-        axes[1].set_xlabel("Epoch")
-        axes[1].set_ylabel("SNR (dB)")
-        axes[1].legend()
+    axes[1].set_title("Validation SNR")
+    axes[1].set_xlabel("Epoch")
+    axes[1].set_ylabel("SNR (dB)")
+    axes[1].legend()
 
-        plt.tight_layout()
-        plt.savefig(
+    plt.tight_layout()
+    plt.savefig(
             output_dir / "cross_validation_metrics.png",
             dpi=300,
         )
-        plt.show()
+    plt.show()
 
-        return fold_results
+    return fold_results
 
 ###################
 # TESTING FUNCTIONS

@@ -1,5 +1,7 @@
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
+
 
 def polar_to_cartesian(output,amplitude_scale=1.0):
     """
@@ -13,12 +15,9 @@ def polar_to_cartesian(output,amplitude_scale=1.0):
     """
     log_amplitude=output[:,0]
     phase=output[:,1]
-    log_amplitude = torch.clamp(
-        log_amplitude, min=0.0, max=20.0
-    )
-    amplitude = (
-        torch.expm1(log_amplitude) * amplitude_scale
-    )
+    log_amplitude = F.softplus(output[:, 0])
+    amplitude = torch.expm1(log_amplitude) * amplitude_scale
+    
     real_part=amplitude*torch.cos(phase)
     imag_part=amplitude*torch.sin(phase)
 
