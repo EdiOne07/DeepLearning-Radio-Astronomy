@@ -308,6 +308,15 @@ def train_one_fold(
 
 
             loss.backward()
+            #Just to inspect the loss
+            if epoch == 0 and total_train_batches == 0:
+                for name, param in model.named_parameters():
+                    if param.grad is not None:
+                        print(
+                            name,
+                            "gradient norm:",
+                            param.grad.norm().item()
+                        )
             optimizer.step()
 
             total_train_loss += loss.item()
@@ -361,6 +370,12 @@ def train_one_fold(
                 },
                 checkpoint_path,
             )
+        diagnose_reconstruction(
+                        model,
+                        train_loader,
+                        device,
+                        transform.amplitude_scale,
+                    )
 
     if best_state is not None:
         model.load_state_dict(best_state)
@@ -577,6 +592,86 @@ def test_loss(path:list[str]):
     print("Wrong reconstruction loss:", wrong_loss.item())
 
     assert wrong_loss > loss
+
+##################
+#Diagnostics
+#################
+
+@torch.no_grad()
+def diagnose_reconstruction(model, loader, device, amplitude_scale):
+    model.eval()
+    was_training = model.training
+    batch = next(iter(loader))
+    x = batch["input_grid"].to(device)
+    target = batch["target_grid"].to(device)
+
+    output = model(x)
+
+    mask = x[:, 2].bool()
+
+    raw_amp = output[:, 0][mask]
+    predicted_phase = output[:, 1][mask]
+
+    true_log_amp = x[:, 0][mask]
+
+    prediction = polar_to_cartesian(
+        output,
+        amplitude_scale=amplitude_scale,
+    )
+
+    pred_complex = torch.complex(
+        prediction[:, 0],
+        prediction[:, 1],
+    )
+
+    true_complex = torch.complex(
+        target[:, 0],
+        target[:, 1],
+    )
+
+    pred_amp = pred_complex.abs()[mask]
+    true_amp = true_complex.abs()[mask]
+
+    error = (pred_complex[mask] - true_complex[mask]).abs().square()
+    power = true_complex[mask].abs().square()
+
+    print("\n--- Reconstruction diagnostic ---")
+    print("Occupancy:", mask.float().mean().item())
+
+    print(
+        "True amplitude (mean/max):",
+        true_amp.mean().item(),
+        true_amp.max().item(),
+    )
+
+    print(
+        "Predicted amplitude (mean/max):",
+        pred_amp.mean().item(),
+        pred_amp.max().item(),
+    )
+
+    print(
+        "True log amplitude (mean):",
+        true_log_amp.mean().item(),
+    )
+
+    print(
+        "Raw amplitude output (min/mean/max):",
+        raw_amp.min().item(),
+        raw_amp.mean().item(),
+        raw_amp.max().item(),
+    )
+
+    print(
+        "Predicted phase (min/mean/max):",
+        predicted_phase.min().item(),
+        predicted_phase.mean().item(),
+        predicted_phase.max().item(),
+    )
+
+    print("Batch NMSE:", (error.sum() / power.sum()).item())
+    model.train(was_training)
+
     
 if __name__ == "__main__":
    
