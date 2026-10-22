@@ -19,7 +19,7 @@ from torch.utils.data import DataLoader
 from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
 from rat_stack import TimeSlicedVisDataset
-from Data_Gridding_Amplitude_Phase import UVDataGridding_Phase
+from Data_Gridding_Patches import UV_Patch_Transform
 from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase,polar_to_cartesian
 from Data_Loading_and_Vizualization.ReconstructVisualization import visualize_reconstruction
 from enum import Enum
@@ -43,13 +43,15 @@ EPOCHS=5
 LEARNING_RATE=1e-3
 LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=1
-GRID_SIZE=256
+GRID_SIZE=8192
 MAX_UV=70000
 BLOCK_SIZE = 32
 HOLDOUT_RATIO = 0.20
 SEED=42
 AMPLITUDE_SCALE=0.1
 WEIGHT_DECAY = 1e-4
+PATCH_SIZE=16
+HANDLE_COLLISION="mean"
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -62,7 +64,7 @@ class Model_Type(Enum):
 # DATA_HANDLING
 ###################
 
-transform=UVDataGridding_Phase(GRID_SIZE,MAX_UV,AMPLITUDE_SCALE)
+transform=UV_Patch_Transform(GRID_SIZE,PATCH_SIZE,MAX_UV,AMPLITUDE_SCALE,HANDLE_COLLISION)
 
 class TransformDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, transform):
@@ -80,15 +82,64 @@ def makeDataset(paths:list[str],use_cuda):
         window_size=WINDOW_SIZE,
         target_size=TARGET_SIZE,
         stride=STRIDE,
-        pin_memory=use_cuda,
+        pin_memory=False,
         read_uvw=True,
     )
     return TransformDataset(dataset=dataset,transform=transform)
+#In case the DataLoader adds one more dimension
+def collate_single_timestep(batch):
+    if len(batch) != 1:
+        raise ValueError("Expected exactly one timestep")
+
+    return batch[0]
 
 ###################
 # MODEL
 ###################
 
+#This wrapper was designed to handle some compression mechanism, but right now it is not useful. Need to fix baseline first
+#class PatchAutoencoder(nn.Module):
+   # def __init__(self, latent_size=512):
+       # super().__init__()
+        #self.feature_projection = nn.Linear(66, 64)
+
+        #self.latent_queries = nn.Parameter(
+          #  torch.randn(8, 1, 64) * 0.02
+        #)
+
+        #self.attention = nn.MultiheadAttention(
+           # embed_dim=64,
+           # num_heads=4,
+           # batch_first=True
+        #)
+
+        #self.autoencoder = Autoencoder.build(
+          #  dimensions=2,
+           # in_channels=3,
+            #out_channels=2,
+            #latent_dim=16,
+            #res_act_fn="silu",
+           # res_norm_type="group",
+           # encoder_args={"n_channels": 16},
+       # )
+
+        #self.latent_size = latent_size
+
+    #def encode_patches(self, patches,patch_positions):
+        #encoder=self.autoencoder.encode(patches)
+        #flattened_patches=encoder.flatten(start_dim=1)
+        #patch_positions_normalized = (
+           # patch_positions.to(
+              #  device=flattened_patches.device,
+                #dtype=flattened_patches.dtype,
+           # ) / 511.0
+       # )
+    
+        #final_encoding=torch.cat((flattened_patches,patch_positions_normalized),dim=1)
+        #return final_encoding
+    #
+
+#Model Builder
 def makeModel(device,model_type:Model_Type):
     if model_type==Model_Type.AUTOENCODER_BASE:
         return Autoencoder.build(
@@ -171,20 +222,20 @@ def validate_model(model,val_loader,criterion,device):
     total_observed = 0.0
 
     for batch in val_loader:
-        input_grid=batch["input_grid"].to(device)
-        target_grid=batch["target_grid"].to(device)
-        occupancy_mask=input_grid[:,2:3,:,:]
+        input_patch=batch["input_patch"].to(device)
+        target_patch=batch["target_patch"].to(device)
+        occupancy_mask=input_patch[:,2:3,:,:]
 
 
-        output=model(input_grid)
+        output=model(input_patch)
         prediction=polar_to_cartesian(output,amplitude_scale=criterion.amplitude_scale)
         squared_error = (
-            (prediction - target_grid)
+            (prediction - target_patch)
             .square()
             .sum(dim=1, keepdim=True)
         )
         target_power = (
-            target_grid
+            target_patch
             .square()
             .sum(dim=1, keepdim=True)
         )
@@ -252,6 +303,7 @@ def train_one_fold(
         shuffle=True,
         num_workers=2,
         pin_memory=False,
+        collate_fn=collate_single_timestep,
     )
 
     val_loader = DataLoader(
@@ -260,6 +312,7 @@ def train_one_fold(
         shuffle=False,
         num_workers=2,
         pin_memory=False,
+        collate_fn=collate_single_timestep
     )
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
@@ -291,14 +344,19 @@ def train_one_fold(
         total_train_batches = 0
 
         for batch in train_loader:
-            input_grid = batch["input_grid"].to(device)
-            target_grid=batch["target_grid"].to(device)
-            original_mask = input_grid[:, 2:3, :, :]
+            input_patch = batch["input_patch"].to(device)
+            target_patch=batch["target_patch"].to(device)
+            original_mask = input_patch[:, 2:3, :, :]
+            if epoch == 0 and total_train_batches == 0:
+                print("Input patches:", input_patch.shape)
+                print("Target patches:", target_patch.shape)
+                print("Occupied cells:", original_mask.sum().item())
+                print("Number of patches:", input_patch.shape[0])
 
             optimizer.zero_grad()
 
-            outputs = model(input_grid)
-            loss = criterion(outputs, target_grid,original_mask)
+            outputs = model(input_patch)
+            loss = criterion(outputs, target_patch,original_mask)
 
             if not torch.isfinite(loss):
                 raise RuntimeError(
@@ -370,24 +428,24 @@ def train_one_fold(
                 },
                 checkpoint_path,
             )
-        diagnose_reconstruction(
-                        model,
-                        train_loader,
-                        device,
-                        transform.amplitude_scale,
-                    )
+        #diagnose_reconstruction(
+                       # model,
+                        #train_loader,
+                        #device,
+                        #transform.amplitude_scale,
+                    #)
 
     if best_state is not None:
         model.load_state_dict(best_state)
-        visualize_reconstruction(
-            model=model,
-            dataset=val_dataset,
-            device=device,
-            amplitude_scale=transform.amplitude_scale,
-            output_dir=output_dir,
-            fold_number=fold_number,
-            sample_index=0,
-        )
+        #visualize_reconstruction(
+         #   model=model,
+          #  dataset=val_dataset,
+           # device=device,
+           # amplitude_scale=transform.amplitude_scale,
+            #output_dir=output_dir,
+            #fold_number=fold_number,
+            #sample_index=0,
+        #)
 
     print(
         f"\nFold {fold_number} best NMSE: {best_nmse:.6f}"
