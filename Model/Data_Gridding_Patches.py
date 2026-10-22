@@ -84,7 +84,7 @@ class UV_Patch_Transform:
 
         input_grid[:,0][mask]=amplitude_normalization[mask]
         input_grid[:,1][mask]=phase[mask]
-        input_grid[:,2][mask] = mask.float()  
+        input_grid[:,2] = mask.float()  
 
 
         return {
