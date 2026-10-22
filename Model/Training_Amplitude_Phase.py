@@ -38,9 +38,9 @@ from chuchichaestli.models.autoencoder import Autoencoder
 WINDOW_SIZE=1
 TARGET_SIZE=1
 STRIDE=1
-BATCH_SIZE=16
+BATCH_SIZE=1
 EPOCHS=5
-LEARNING_RATE=1e-3
+LEARNING_RATE=1e-4
 LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=1
 GRID_SIZE=8192
@@ -301,7 +301,7 @@ def train_one_fold(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=2,
+        num_workers=0,
         pin_memory=False,
         collate_fn=collate_single_timestep,
     )
@@ -310,7 +310,7 @@ def train_one_fold(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=2,
+        num_workers=0,
         pin_memory=False,
         collate_fn=collate_single_timestep
     )
@@ -359,15 +359,32 @@ def train_one_fold(
             loss = criterion(outputs, target_patch,original_mask)
 
             if not torch.isfinite(loss):
+                print("\n--- NON-FINITE LOSS DIAGNOSTIC ---")
+                print("Input finite:", torch.isfinite(input_patch).all().item())
+                print("Target finite:", torch.isfinite(target_patch).all().item())
+                print("Output finite:", torch.isfinite(outputs).all().item())
+
+                print("Output min:", outputs.detach().amin().item())
+                print("Output max:", outputs.detach().amax().item())
+                print("Raw amplitude maximum:", outputs[:, 0].detach().amax().item())
+                print("Target absolute maximum:", target_patch.detach().abs().amax().item())
+
                 raise RuntimeError(
-                    f"Non-finite loss in fold {fold_number}, "
-                    f"epoch {epoch + 1}"
+                    f"Non-finite loss in fold {fold_number}, epoch {epoch + 1}, "
+                    f"batch {total_train_batches + 1}"
                 )
 
 
             loss.backward()
+
+            grad_norm = torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+                error_if_nonfinite=True,
+            )
             #Just to inspect the loss
             if epoch == 0 and total_train_batches == 0:
+                print(f"Gradient norm before clipping: {grad_norm.item():.4f}")
                 for name, param in model.named_parameters():
                     if param.grad is not None:
                         print(
@@ -434,7 +451,7 @@ def train_one_fold(
                         #device,
                         #transform.amplitude_scale,
                     #)
-
+    
     if best_state is not None:
         model.load_state_dict(best_state)
         #visualize_reconstruction(

@@ -13,10 +13,9 @@ def polar_to_cartesian(output,amplitude_scale=1.0):
         Channel 0: real
         Channel 1: imaginary
     """
-    log_amplitude=output[:,0]
+    raw_amplitude=output[:,0]
     phase=output[:,1]
-    log_amplitude = F.softplus(output[:, 0])
-    amplitude = torch.expm1(log_amplitude) * amplitude_scale
+    amplitude = amplitude_scale * torch.nn.functional.softplus(raw_amplitude)
     
     real_part=amplitude*torch.cos(phase)
     imag_part=amplitude*torch.sin(phase)
