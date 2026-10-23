@@ -21,7 +21,7 @@ from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
 from rat_stack import TimeSlicedVisDataset
 from Data_Gridding_Patches import UV_Patch_Transform
-from MSE_Loss_Amplitude_Phase import MSELoss_Amplitude_Phase,polar_to_cartesian
+from MSE_Loss_Amplitude_Phase import MaskedComplexMSE,polar_to_cartesian
 from Data_Loading_and_Vizualization.ReconstructVisualization import visualize_reconstruction
 from enum import Enum
 
@@ -229,7 +229,8 @@ def validate_model(model,val_loader,criterion,device):
 
 
         output=model(input_patch)
-        prediction=polar_to_cartesian(output,amplitude_scale=criterion.amplitude_scale)
+       # prediction=polar_to_cartesian(output,amplitude_scale=criterion.amplitude_scale)
+        prediction=output
         squared_error = (
             (prediction - target_patch)
             .square()
@@ -320,9 +321,7 @@ def train_one_fold(
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
 
-    criterion = MSELoss_Amplitude_Phase(
-        amplitude_scale=transform.amplitude_scale
-    )
+    criterion = MaskedComplexMSE()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -369,7 +368,8 @@ def train_one_fold(
 
                 print("Output min:", outputs.detach().amin().item())
                 print("Output max:", outputs.detach().amax().item())
-                print("Raw amplitude maximum:", outputs[:, 0].detach().amax().item())
+                print("Predicted real maximum:", outputs[:, 0].detach().amax().item())
+                print("Predicted imaginary maximum:", outputs[:, 1].detach().amax().item())
                 print("Target absolute maximum:", target_patch.detach().abs().amax().item())
 
                 raise RuntimeError(
