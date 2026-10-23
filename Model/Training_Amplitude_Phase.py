@@ -40,7 +40,7 @@ WINDOW_SIZE=1
 TARGET_SIZE=1
 STRIDE=1
 BATCH_SIZE=1
-EPOCHS=25
+EPOCHS=100
 LEARNING_RATE=1e-4
 LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=1
@@ -248,7 +248,20 @@ def validate_model(model,val_loader,criterion,device):
         total_power += (
             target_power * occupancy_mask
         ).sum().item()
+        pred_power = (
+            prediction.square().sum(dim=1, keepdim=True)
+            * occupancy_mask
+        ).sum()
 
+        true_power = (
+            target_patch.square().sum(dim=1, keepdim=True)
+            * occupancy_mask
+        ).sum()
+
+        print(
+            "Predicted/target power:",
+            (pred_power / true_power.clamp_min(1e-12)).item()
+        )
         total_observed += occupancy_mask.sum().item()
 
     if total_observed == 0:
