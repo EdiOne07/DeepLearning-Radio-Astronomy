@@ -15,6 +15,7 @@ import torch.nn as nn
 import matplotlib.pyplot as plt
 
 from torch.utils.data import DataLoader
+from torch.utils.data import Subset
 
 from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
@@ -39,7 +40,7 @@ WINDOW_SIZE=1
 TARGET_SIZE=1
 STRIDE=1
 BATCH_SIZE=1
-EPOCHS=5
+EPOCHS=25
 LEARNING_RATE=1e-4
 LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=1
@@ -296,6 +297,8 @@ def train_one_fold(
             f"Fold {fold_number} has an empty dataset. "
             "Check file paths and time-window settings."
         )
+    train_dataset = Subset(train_dataset, [0])
+    val_dataset=train_dataset
 
     train_loader = DataLoader(
         train_dataset,
