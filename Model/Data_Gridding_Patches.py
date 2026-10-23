@@ -82,14 +82,9 @@ class UV_Patch_Transform:
         phase=torch.atan2(imaginary,real)
         amplitude_normalization=torch.log1p((amplitude/self.amplitude_scale))
 
-        #input_grid[:,0][mask]=amplitude_normalization[mask]
-        #input_grid[:,1][mask]=phase[mask]
-        #input_grid[:,2] = mask.float()  
-        # Cartesian input representation
-        input_grid[:, 0] = real
-        input_grid[:, 1] = imaginary
-        input_grid[:, 2] = mask.float()
-
+        input_grid[:,0][mask]=amplitude_normalization[mask]
+        input_grid[:,1][mask]=phase[mask]
+        input_grid[:,2] = mask.float()  
         return {
             "input_patch": input_grid,
             "target_patch":target_grid,
