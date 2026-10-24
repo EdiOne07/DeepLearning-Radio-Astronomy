@@ -26,10 +26,10 @@ from chuchichaestli.models.autoencoder import Autoencoder
 
 WINDOW_SIZE = 8
 TARGET_SIZE = 1
-STRIDE = 1
+STRIDE = 16
 BATCH_SIZE = 16 
 PATCH_MICROBATCH = 128  # maximum patches passed through model at once
-EPOCHS = 50
+EPOCHS = 25
 K_FOLDS = 5
 LEARNING_RATE = 1e-4
 WEIGHT_DECAY = 1e-4
@@ -161,7 +161,7 @@ def validate_model(model, val_loader, device):
 def make_loader(dataset, shuffle):
     return DataLoader(
         dataset, batch_size=BATCH_SIZE, shuffle=shuffle,
-        num_workers=0, pin_memory=False, collate_fn=collate_windows,
+        num_workers=2, pin_memory=False, collate_fn=collate_windows,
     )
 
 
