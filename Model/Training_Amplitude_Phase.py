@@ -24,6 +24,9 @@ from Data_Gridding_Patches import UV_Patch_Transform
 from MSE_Loss_Amplitude_Phase import MaskedComplexMSE,polar_to_cartesian
 from Data_Loading_and_Vizualization.ReconstructVisualization import visualize_reconstruction
 from enum import Enum
+from Visibility_Standerdizer import VisibilityStandardizer
+from Polarization_Standardization import PolarizationStandardization
+import torch.nn.functional as F
 
 chuchichaestli_src = Path(
     "/home/edione/Projects/chuchichaestli/src"
@@ -38,12 +41,12 @@ from chuchichaestli.models.autoencoder import Autoencoder
 ###################
 WINDOW_SIZE=1
 TARGET_SIZE=1
-STRIDE=1
+STRIDE=8
 BATCH_SIZE=1
-EPOCHS=100
+EPOCHS=50
 LEARNING_RATE=1e-4
 LAMBDA_SMOOTHNESS=1e-6
-K_FOLDS=1
+K_FOLDS=5
 GRID_SIZE=8192
 MAX_UV=70000
 BLOCK_SIZE = 32
@@ -65,15 +68,15 @@ class Model_Type(Enum):
 # DATA_HANDLING
 ###################
 
-transform=UV_Patch_Transform(GRID_SIZE,PATCH_SIZE,MAX_UV,AMPLITUDE_SCALE,HANDLE_COLLISION)
-
 class TransformDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, transform):
+    def __init__(self, dataset, transform, standardizer):
         self.dataset=dataset
         self.transform=transform
+        self.standardizer=standardizer
     def __getitem__(self, index):
-        item=self.dataset[index]
-        return self.transform(item)
+        sample = self.dataset[index]
+        normalized = self.standardizer.transform(sample["vis"])
+        return self.transform(normalized).squeeze(0)
     def __len__(self):
         return len(self.dataset)
 
@@ -86,14 +89,7 @@ def makeDataset(paths:list[str],use_cuda):
         pin_memory=False,
         read_uvw=True,
     )
-    return TransformDataset(dataset=dataset,transform=transform)
-#In case the DataLoader adds one more dimension
-def collate_single_timestep(batch):
-    if len(batch) != 1:
-        raise ValueError("Expected exactly one timestep")
-
-    return batch[0]
-
+    return dataset
 ###################
 # MODEL
 ###################
@@ -145,12 +141,30 @@ def makeModel(device,model_type:Model_Type):
     if model_type==Model_Type.AUTOENCODER_BASE:
         return Autoencoder.build(
                 dimensions=2,
-                in_channels=3,
-                out_channels=2,
+                in_channels=8,
+                out_channels=8,
                 latent_dim=16,
                 res_act_fn="silu",
                 res_norm_type="group",
-                encoder_args={"n_channels": 16},
+                encoder_args={
+                    "n_channels": 16,
+                    "down_block_types": (
+                        "AutoencoderDownBlock",
+                        "AutoencoderDownBlock",
+                        "AttnAutoencoderDownBlock",
+                    ),
+                    "block_out_channel_mults": (1, 2, 2),
+                    "num_layers_per_block": 1,
+                },
+                decoder_args={
+                    "up_block_types": (
+                        "AttnAutoencoderUpBlock",
+                        "AutoencoderUpBlock",
+                        "AutoencoderUpBlock",
+                    ),
+                    "block_out_channel_mults": (1, 2, 2),
+                    "num_layers_per_block": 1,
+                },
             ).to(device)
     elif model_type==Model_Type.FUTURE_AUTOENCODER:
         # tbd
@@ -159,33 +173,51 @@ def makeModel(device,model_type:Model_Type):
 ###################
 # METRICS
 ###################
+def channels_to_complex(channels):
+    # Input: [1, 8, F, B]
+    assert channels.ndim == 4
+    assert channels.shape[0] == 1
+    assert channels.shape[1] == 8
+
+    _, _, freq, baselines = channels.shape
+
+    components = channels.squeeze(0).reshape(
+        4, 2, freq, baselines
+    )
+
+    components = components.permute(2, 3, 0, 1)
+
+    return torch.complex(
+        components[..., 0].contiguous(),
+        components[..., 1].contiguous(),
+    )
 
 @torch.no_grad()
-def compute_reconstruction_metrics(pred, target, mask):
-    """
-    Evaluate only the deliberately hidden observed cells.
+def compute_reconstruction_metrics(pred, target, standardizer):
+    # pred / target: [1, 8, F, B], standardized
+    pred_complex = channels_to_complex(pred.cpu())
+    target_complex = channels_to_complex(target.cpu())
 
-    pred, target: [B, 2, H, W]
-    mask:         [B, 1, H, W]
-    """
-    mask = mask.expand_as(target)
+    pred_original = standardizer.inverse_transform(pred_complex)
+    target_original = standardizer.inverse_transform(target_complex)
 
-    squared_error = ((pred - target) ** 2 * mask).sum()
-    target_power = (target ** 2 * mask).sum()
+    error = (
+        (pred_original - target_original)
+        .abs()
+        .square()
+        .sum()
+        .item()
+    )
 
-    nmse = (
-        squared_error / target_power.clamp_min(1e-8)
-    ).item()
+    power = (
+        target_original
+        .abs()
+        .square()
+        .sum()
+        .item()
+    )
 
-    snr_db = (
-        10.0
-        * torch.log10(
-            target_power
-            / squared_error.clamp_min(1e-8)
-        )
-    ).item()
-
-    return nmse, snr_db
+    return error, power
 
 ###################
 # MASKING
@@ -216,71 +248,45 @@ def make_model_and_input_target(grid,heldout_mask):
 ###################
 
 @torch.no_grad()
-def validate_model(model,val_loader,criterion,device):
+def validate_model(model, val_loader, criterion, device, standardizer):
     model.eval()
+
+    total_loss = 0.0
+    total_samples = 0
+
     total_error = 0.0
     total_power = 0.0
-    total_observed = 0.0
 
     for batch in val_loader:
-        input_patch=batch["input_patch"].to(device)
-        target_patch=batch["target_patch"].to(device)
-        occupancy_mask=input_patch[:,2:3,:,:]
+        x = batch.to(device)
 
+        height, width = x.shape[-2:]
+        pad_h = (-height) % 4
+        pad_w = (-width) % 4
 
-        output=model(input_patch)
-       # prediction=polar_to_cartesian(output,amplitude_scale=criterion.amplitude_scale)
-        prediction=output
-        squared_error = (
-            (prediction - target_patch)
-            .square()
-            .sum(dim=1, keepdim=True)
-        )
-        target_power = (
-            target_patch
-            .square()
-            .sum(dim=1, keepdim=True)
-        )
-        total_error += (
-            squared_error * occupancy_mask
-        ).sum().item()
+        padded = F.pad(x, (0, pad_w, 0, pad_h))
 
-        total_power += (
-            target_power * occupancy_mask
-        ).sum().item()
-        pred_power = (
-            prediction.square().sum(dim=1, keepdim=True)
-            * occupancy_mask
-        ).sum()
+        output = model(padded)
+        output = output[..., :height, :width]
 
-        true_power = (
-            target_patch.square().sum(dim=1, keepdim=True)
-            * occupancy_mask
-        ).sum()
+        loss = criterion(output, x)
 
-        print(
-            "Predicted/target power:",
-            (pred_power / true_power.clamp_min(1e-12)).item()
-        )
-        total_observed += occupancy_mask.sum().item()
+        total_loss += loss.item() * x.shape[0]
+        total_samples += x.shape[0]
 
-    if total_observed == 0:
-        raise RuntimeError(
-            "Validation contains no observed UV cells."
-        )
-    val_loss = total_error / total_observed
-    if total_power <= 0:
-        raise RuntimeError(
-            "Validation target has zero signal power."
+        error, power = compute_reconstruction_metrics(
+            output, x, standardizer
         )
 
+        total_error += error
+        total_power += power
+
+    if total_samples == 0 or total_power <= 0:
+        raise RuntimeError("Invalid validation dataset")
+
+    val_loss = total_loss / total_samples
     nmse = total_error / total_power
-
-    snr_db = (
-        -10.0 * math.log10(nmse)
-        if nmse > 0
-        else float("inf")
-    )
+    snr_db = -10.0 * math.log10(nmse) if nmse > 0 else math.inf
 
     return val_loss, nmse, snr_db
 
@@ -305,36 +311,74 @@ def train_one_fold(
 
     train_dataset = makeDataset(train_paths, use_cuda)
     val_dataset = makeDataset(val_paths, use_cuda)
+    if train_paths == val_paths:
+        raw_dataset = train_dataset
 
+        train_count = min(32, len(raw_dataset) - 1)
+        val_count = min(8, len(raw_dataset) - train_count)
+
+        if train_count < 1 or val_count < 1:
+            raise RuntimeError("Not enough windows for testing")
+
+        train_dataset = Subset(
+            raw_dataset,
+            list(range(train_count))
+        )
+        val_dataset = Subset(
+            raw_dataset,
+            list(range(train_count, train_count + val_count))
+        )
+    standardizer = VisibilityStandardizer()
+
+    num_stats_samples = min(32, len(train_dataset))
+
+    indices = torch.linspace(
+        0,
+        len(train_dataset) - 1,
+        steps=num_stats_samples
+    ).long()
+
+    statistics_data = torch.cat(
+        [train_dataset[i]["vis"] for i in indices.tolist()],
+        dim=0
+    )
+
+    standardizer.fit(statistics_data)
+    del statistics_data
+
+    channel_transform = PolarizationStandardization()
+
+    train_dataset = TransformDataset(
+        train_dataset, channel_transform, standardizer
+    )
+
+    val_dataset = TransformDataset(
+        val_dataset, channel_transform, standardizer
+    )
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise RuntimeError(
             f"Fold {fold_number} has an empty dataset. "
             "Check file paths and time-window settings."
         )
-    train_dataset = Subset(train_dataset, [0])
-    val_dataset=train_dataset
-
     train_loader = DataLoader(
         train_dataset,
         batch_size=BATCH_SIZE,
         shuffle=True,
-        num_workers=0,
+        num_workers=2,
         pin_memory=False,
-        collate_fn=collate_single_timestep,
     )
 
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
         shuffle=False,
-        num_workers=0,
+        num_workers=2,
         pin_memory=False,
-        collate_fn=collate_single_timestep
     )
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
 
-    criterion = MaskedComplexMSE()
+    criterion = nn.MSELoss()
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -359,19 +403,21 @@ def train_one_fold(
         total_train_batches = 0
 
         for batch in train_loader:
-            input_patch = batch["input_patch"].to(device)
-            target_patch=batch["target_patch"].to(device)
-            original_mask = input_patch[:, 2:3, :, :]
-            if epoch == 0 and total_train_batches == 0:
-                print("Input patches:", input_patch.shape)
-                print("Target patches:", target_patch.shape)
-                print("Occupied cells:", original_mask.sum().item())
-                print("Number of patches:", input_patch.shape[0])
+            x = batch.to(device)
+
+            height, width = x.shape[-2:]
+
+            pad_h = (-height) % 4
+            pad_w = (-width) % 4
+
+            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
 
             optimizer.zero_grad()
 
-            outputs = model(input_patch)
-            loss = criterion(outputs, target_patch,original_mask)
+            outputs = model(x_padded)
+            outputs = outputs[..., :height, :width]
+
+            loss = criterion(outputs, x)
 
             if not torch.isfinite(loss):
                 print("\n--- NON-FINITE LOSS DIAGNOSTIC ---")
@@ -418,11 +464,12 @@ def train_one_fold(
         )
 
         val_loss, val_nmse, val_snr = validate_model(
-            model,
-            val_loader,
-            criterion,
-            device,
-        )
+                model,
+                val_loader,
+                criterion,
+                device,
+                standardizer,
+            )
 
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(val_loss)
@@ -458,6 +505,12 @@ def train_one_fold(
                     "val_snr_db": val_snr,
                     "train_paths": train_paths,
                     "val_paths": val_paths,
+                    "normalization": {
+                    "real_mean": standardizer.real_mean.cpu(),
+                    "real_std": standardizer.real_std.cpu(),
+                    "imag_mean": standardizer.imag_mean.cpu(),
+                    "imag_std": standardizer.imag_std.cpu(),
+                    },
                 },
                 checkpoint_path,
             )
@@ -492,12 +545,8 @@ def train_one_fold(
 ###########################
 
 def train_model(paths):
-    if len(paths) != 5:
-        raise ValueError(
-            f"Expected 5 independent .vis observations, "
-            f"but received {len(paths)} paths. "
-            "Pass exactly one path per observation."
-        )
+    if len(paths) not in (1, 5):
+        raise ValueError("Provide one observation for testing or five for cross-validation")
 
     paths = sorted(paths)
 
@@ -512,6 +561,17 @@ def train_model(paths):
 
     output_dir = Path("cross_validation_results")
     output_dir.mkdir(parents=True, exist_ok=True)
+
+    if len(paths) == 1:
+        print("Single-observation integration test")
+        train_one_fold(
+            fold_number=1,
+            train_paths=paths,
+            val_paths=paths,
+            output_dir=output_dir,
+            device=device,
+        )
+        return []
 
     fold_results = []
 
@@ -684,6 +744,64 @@ def test_loss(path:list[str]):
 
     assert wrong_loss > loss
 
+
+
+def test_overfit_single_slice(model, model_input, device, steps=100):
+    import torch
+    import torch.nn.functional as F
+
+    model = model.to(device)
+    model.train()
+
+    x = model_input.to(device)
+    height, width = x.shape[-2:]
+
+    pad_h = (-height) % 4
+    pad_w = (-width) % 4
+    x_padded = F.pad(x, (0, pad_w, 0, pad_h))
+
+    optimizer = torch.optim.AdamW(
+        model.parameters(),
+        lr=1e-4,
+        weight_decay=0.0
+    )
+
+    losses = []
+
+    for step in range(steps):
+        optimizer.zero_grad()
+
+        reconstruction = model(x_padded)
+        reconstruction = reconstruction[..., :height, :width]
+
+        loss = F.mse_loss(reconstruction, x)
+
+        if not torch.isfinite(loss):
+            raise RuntimeError("Non-finite loss")
+
+        loss.backward()
+        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+        optimizer.step()
+
+        losses.append(loss.item())
+
+        if step == 0 or (step + 1) % 10 == 0:
+            print(f"Step {step + 1}: MSE = {loss.item():.6f}")
+
+    initial = losses[0]
+    final = losses[-1]
+
+    improvement = (initial - final) / initial * 100
+
+    print(f"\nInitial MSE: {initial:.6f}")
+    print(f"Final MSE:   {final:.6f}")
+    print(f"Improvement: {improvement:.2f}%")
+
+    return losses
+
+
+
+
 ##################
 #Diagnostics
 #################
@@ -772,10 +890,5 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-
-    if len(paths) != 5:
-        print(len(paths))
-        raise ValueError("Provide exactly five .vis observations")
-
     train_model(paths=paths)
     
