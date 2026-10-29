@@ -14,8 +14,7 @@ import torch
 import torch.nn as nn
 import matplotlib.pyplot as plt
 
-from torch.utils.data import DataLoader
-from torch.utils.data import Subset
+from torch.utils.data import Subset, ConcatDataset, DataLoader
 
 from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
@@ -55,7 +54,6 @@ SEED=42
 AMPLITUDE_SCALE=0.1
 WEIGHT_DECAY = 1e-4
 PATCH_SIZE=16
-HANDLE_COLLISION="mean"
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
@@ -63,6 +61,11 @@ device = torch.device("cuda" if use_cuda else "cpu")
 class Model_Type(Enum):
     AUTOENCODER_BASE="AUTOENCODER_BASE"
     FUTURE_AUTOENCODER="FUTURE_AUTOENCODER"
+
+class Training_Strategy(Enum):
+    ONE_VISIBILITY="ONE_VISIBILITY"
+    FIVE_FOLD_CROSS="FIVE_FOLD_CROSS"
+    POOLED_STRATIFIED_SPLIT="POOLED_STRATIFIED_SPLIT"
 
 ###################
 # DATA_HANDLING
@@ -317,6 +320,7 @@ def train_one_fold(
     val_paths,
     output_dir,
     device,
+    training_strategy=Training_Strategy.FIVE_FOLD_CROSS
 ):
     print("\n" + "=" * 70)
     print(f"FOLD {fold_number}/5")
@@ -328,7 +332,7 @@ def train_one_fold(
 
     train_dataset = makeDataset(train_paths, use_cuda)
     val_dataset = makeDataset(val_paths, use_cuda)
-    if train_paths == val_paths:
+    if training_strategy==Training_Strategy.ONE_VISIBILITY:
         raw_dataset = train_dataset
 
         train_count = min(32, len(raw_dataset) - 1)
@@ -345,44 +349,48 @@ def train_one_fold(
             raw_dataset,
             list(range(train_count, train_count + val_count))
         )
+
+    elif training_strategy==Training_Strategy.POOLED_STRATIFIED_SPLIT:
+            train_parts = []
+            val_parts = []
+    
+            for path in train_paths:
+                dataset = makeDataset([path], use_cuda)
+    
+                split = int(0.8 * len(dataset))
+    
+                train_parts.append(
+                    Subset(dataset, range(0, split))
+                )
+    
+                val_parts.append(
+                    Subset(dataset, range(split, len(dataset)))
+                )
+    
+            train_dataset = ConcatDataset(train_parts)
+            val_dataset = ConcatDataset(val_parts)
+    elif training_strategy!=Training_Strategy.FIVE_FOLD_CROSS:
+        raise ValueError("Unknown Strategy or didn't select strategy")
+
+
     standardizer = VisibilityStandardizer()
 
-    
-    SAMPLES_PER_OBSERVATION = 8
 
-    statistics_samples = []
+    num_stats_samples = min(32, len(train_dataset))
 
-    for path in train_paths:
-        observation_dataset = makeDataset([path], use_cuda)
-
-        num_samples = min(
-            SAMPLES_PER_OBSERVATION,
-            len(observation_dataset)
-        )
-
-        if num_samples == 0:
-            raise RuntimeError(f"No samples available for {path}")
-
-        indices = torch.linspace(
+    indices = torch.linspace(
             0,
-            len(observation_dataset) - 1,
-            steps=num_samples
+            len(train_dataset) - 1,
+            steps=num_stats_samples
         ).long()
 
-        for index in indices.tolist():
-            statistics_samples.append(
-                observation_dataset[index]["vis"]
-            )
-
-        print(
-            f"Normalization: sampled {num_samples} timesteps from {Path(path).name}"
+    statistics_data = torch.cat(
+            [train_dataset[i]["vis"] for i in indices.tolist()],
+            dim=0
         )
 
-    statistics_data = torch.cat(statistics_samples, dim=0)
-
     standardizer.fit(statistics_data)
-
-    del statistics_data, statistics_samples
+    del statistics_data
 
 
     channel_transform = PolarizationStandardization()
@@ -466,6 +474,12 @@ def train_one_fold(
 
             loss.backward()
 
+            torch.nn.utils.clip_grad_norm_(
+                model.parameters(),
+                max_norm=1.0,
+                error_if_nonfinite=True,
+            )
+            
             optimizer.step()
 
             total_train_loss += loss.item()
@@ -556,34 +570,42 @@ def train_one_fold(
 # Five-Fold Cross Validation
 ###########################
 
-def train_model(paths):
-    if len(paths) not in (1, 5):
-        raise ValueError("Provide one observation for testing or five for cross-validation")
+def train_model(paths,training_strategy):
 
     paths = sorted(paths)
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    use_cuda = torch.cuda.is_available()
-    device = torch.device("cuda" if use_cuda else "cpu")
+    output_dir = Path("results") / training_strategy.value.lower()
+    output_dir.mkdir(parents=True, exist_ok=True)
+
+    if training_strategy == Training_Strategy.ONE_VISIBILITY:
+        if len(paths) != 1:
+            raise ValueError("ONE_VISIBILITY requires one observation")
+
+        train_one_fold(
+            1, paths, paths, output_dir, device, training_strategy
+        )
+        return []
+
+    if training_strategy == Training_Strategy.POOLED_STRATIFIED_SPLIT:
+        if len(paths) != 5:
+            raise ValueError("Pooled training requires five observations")
+
+        train_one_fold(
+            1, paths, paths, output_dir, device, training_strategy
+        )
+        return []
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
 
     print("Device:", device)
     print("Number of observations:", len(paths))
+    if training_strategy != Training_Strategy.FIVE_FOLD_CROSS:
+        raise ValueError(f"Unsupported strategy: {training_strategy}")
 
-    output_dir = Path("cross_validation_results")
-    output_dir.mkdir(parents=True, exist_ok=True)
-
-    if len(paths) == 1:
-        print("Single-observation integration test")
-        train_one_fold(
-            fold_number=1,
-            train_paths=paths,
-            val_paths=paths,
-            output_dir=output_dir,
-            device=device,
-        )
-        return []
+    if len(paths) != 5:
+        raise ValueError("Five-fold cross-validation requires five observations")
 
     fold_results = []
 
@@ -603,6 +625,7 @@ def train_model(paths):
                 val_paths=val_paths,
                 output_dir=output_dir,
                 device=device,
+                training_strategy=training_strategy
             )
 
         fold_results.append({
@@ -726,36 +749,6 @@ def check_model_functionalities(path:list[str]):
         "Tensor-size ratio:",
         original_bytes / latent_bytes
     )
-
-#Loss testing funciton for MSE_Loss_Amplitude_Phase
-def test_loss(path:list[str]):
-    data=makeDataset(paths,use_cuda=use_cuda)
-    criterion = MSELoss_Amplitude_Phase(
-    amplitude_scale=data.transform.amplitude_scale
-)
-
-    sample = data[0]
-
-    input_grid = sample["input_grid"].unsqueeze(0)
-    target = sample["target_grid"].unsqueeze(0)
-
-    mask = input_grid[:, 2:3]
-
-    perfect_output = input_grid[:, 0:2]
-
-    loss = criterion(perfect_output, target, mask)
-
-    print("Perfect reconstruction loss:", loss.item())
-
-    wrong_output = perfect_output.clone()
-    wrong_output[:, 1] += 0.5
-
-    wrong_loss = criterion(wrong_output, target, mask)
-
-    print("Wrong reconstruction loss:", wrong_loss.item())
-
-    assert wrong_loss > loss
-
 
 
 def test_overfit_single_slice(model, model_input, device, steps=100):
@@ -902,5 +895,5 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    train_model(paths=paths)
+    train_model(paths=paths,training_strategy=Training_Strategy.POOLED_STRATIFIED_SPLIT)
     
