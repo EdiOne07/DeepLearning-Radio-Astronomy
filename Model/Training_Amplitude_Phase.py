@@ -269,6 +269,23 @@ def validate_model(model, val_loader, criterion, device, standardizer):
         output = model(padded)
         output = output[..., :height, :width]
 
+        if total_samples == 0:
+            print(
+                "Validation input power:",
+                x.square().mean().item()
+            )
+            print(
+                "Validation predicted power:",
+                output.square().mean().item()
+            )
+            print(
+                "Validation predicted/input power ratio:",
+                (
+                    output.square().sum()
+                    / x.square().sum().clamp_min(1e-12)
+                ).item()
+            )
+
         loss = criterion(output, x)
 
         total_loss += loss.item() * x.shape[0]
@@ -330,21 +347,43 @@ def train_one_fold(
         )
     standardizer = VisibilityStandardizer()
 
-    num_stats_samples = min(32, len(train_dataset))
+    
+    SAMPLES_PER_OBSERVATION = 8
 
-    indices = torch.linspace(
-        0,
-        len(train_dataset) - 1,
-        steps=num_stats_samples
-    ).long()
+    statistics_samples = []
 
-    statistics_data = torch.cat(
-        [train_dataset[i]["vis"] for i in indices.tolist()],
-        dim=0
-    )
+    for path in train_paths:
+        observation_dataset = makeDataset([path], use_cuda)
+
+        num_samples = min(
+            SAMPLES_PER_OBSERVATION,
+            len(observation_dataset)
+        )
+
+        if num_samples == 0:
+            raise RuntimeError(f"No samples available for {path}")
+
+        indices = torch.linspace(
+            0,
+            len(observation_dataset) - 1,
+            steps=num_samples
+        ).long()
+
+        for index in indices.tolist():
+            statistics_samples.append(
+                observation_dataset[index]["vis"]
+            )
+
+        print(
+            f"Normalization: sampled {num_samples} timesteps from {Path(path).name}"
+        )
+
+    statistics_data = torch.cat(statistics_samples, dim=0)
 
     standardizer.fit(statistics_data)
-    del statistics_data
+
+    del statistics_data, statistics_samples
+
 
     channel_transform = PolarizationStandardization()
 
@@ -416,44 +455,17 @@ def train_one_fold(
 
             outputs = model(x_padded)
             outputs = outputs[..., :height, :width]
+            if epoch == 0 and total_train_batches == 0:
+                print("Input mean:", x.mean(dim=(0, 2, 3)))
+                print("Input std:", x.std(dim=(0, 2, 3), correction=0))
+
+                print("Output mean:", outputs.mean(dim=(0, 2, 3)))
+                print("Output std:", outputs.std(dim=(0, 2, 3), correction=0))
 
             loss = criterion(outputs, x)
 
-            if not torch.isfinite(loss):
-                print("\n--- NON-FINITE LOSS DIAGNOSTIC ---")
-                print("Input finite:", torch.isfinite(input_patch).all().item())
-                print("Target finite:", torch.isfinite(target_patch).all().item())
-                print("Output finite:", torch.isfinite(outputs).all().item())
-
-                print("Output min:", outputs.detach().amin().item())
-                print("Output max:", outputs.detach().amax().item())
-                print("Predicted real maximum:", outputs[:, 0].detach().amax().item())
-                print("Predicted imaginary maximum:", outputs[:, 1].detach().amax().item())
-                print("Target absolute maximum:", target_patch.detach().abs().amax().item())
-
-                raise RuntimeError(
-                    f"Non-finite loss in fold {fold_number}, epoch {epoch + 1}, "
-                    f"batch {total_train_batches + 1}"
-                )
-
-
             loss.backward()
 
-            grad_norm = torch.nn.utils.clip_grad_norm_(
-                model.parameters(),
-                max_norm=1.0,
-                error_if_nonfinite=True,
-            )
-            #Just to inspect the loss
-            if epoch == 0 and total_train_batches == 0:
-                print(f"Gradient norm before clipping: {grad_norm.item():.4f}")
-                for name, param in model.named_parameters():
-                    if param.grad is not None:
-                        print(
-                            name,
-                            "gradient norm:",
-                            param.grad.norm().item()
-                        )
             optimizer.step()
 
             total_train_loss += loss.item()
