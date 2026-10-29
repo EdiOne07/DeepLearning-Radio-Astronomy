@@ -452,6 +452,11 @@ def train_one_fold(
         for batch in train_loader:
             x = batch.to(device)
 
+            if not torch.isfinite(x).all():
+                raise RuntimeError(
+                    f"Non-finite input at epoch {epoch + 1}"
+                )
+
             height, width = x.shape[-2:]
 
             pad_h = (-height) % 4
@@ -463,17 +468,33 @@ def train_one_fold(
 
             outputs = model(x_padded)
             outputs = outputs[..., :height, :width]
+            if not torch.isfinite(outputs).all():
+                raise RuntimeError(
+                    f"Non-finite model output at epoch {epoch + 1}"
+                )
+            
             if epoch == 0 and total_train_batches == 0:
                 print("Input mean:", x.mean(dim=(0, 2, 3)))
                 print("Input std:", x.std(dim=(0, 2, 3), correction=0))
-
+                print("Input min:", x.min().item())
+                print("Input max:", x.max().item())
+                print("Input std:", x.std().item())
                 print("Output mean:", outputs.mean(dim=(0, 2, 3)))
-                print("Output std:", outputs.std(dim=(0, 2, 3), correction=0))
+                print("Output std:", outputs.std(dim=(0, 2, 3), correction=0))    
 
             loss = criterion(outputs, x)
-
+            if not torch.isfinite(loss):
+                raise RuntimeError(
+                    f"Non-finite loss at epoch {epoch + 1}: {loss.item()}"
+                )
             loss.backward()
-
+            for name, parameter in model.named_parameters():
+                if parameter.grad is not None:
+                    if not torch.isfinite(parameter.grad).all():
+                        raise RuntimeError(
+                            f"Non-finite gradient in {name} "
+                            f"at epoch {epoch + 1}"
+                        )
             torch.nn.utils.clip_grad_norm_(
                 model.parameters(),
                 max_norm=1.0,
