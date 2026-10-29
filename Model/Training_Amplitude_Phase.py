@@ -64,6 +64,8 @@ class Model_Type(Enum):
 
 class Training_Strategy(Enum):
     ONE_VISIBILITY="ONE_VISIBILITY"
+    ONE_VISIBILITY_FULL = "ONE_VISIBILITY_FULL"
+    ONE_VISIBILITY_DISTRIBUTED = "ONE_VISIBILITY_DISTRIBUTED"
     FIVE_FOLD_CROSS="FIVE_FOLD_CROSS"
     POOLED_STRATIFIED_SPLIT="POOLED_STRATIFIED_SPLIT"
 
@@ -372,6 +374,55 @@ def train_one_fold(
 
         train_dataset = ConcatDataset(train_parts)
         val_dataset = ConcatDataset(val_parts)
+    
+    elif training_strategy == Training_Strategy.ONE_VISIBILITY_DISTRIBUTED:
+        dataset = train_dataset
+        n = len(dataset)
+
+        split = int(0.8 * n)
+
+        if split < 32 or n - split < 8:
+            raise RuntimeError("Not enough windows for distributed test")
+
+        train_indices = torch.linspace(
+            0, split - 1, steps=32
+        ).round().long().tolist()
+
+        val_indices = torch.linspace(
+            split, n - 1, steps=8
+        ).round().long().tolist()
+
+        train_dataset = Subset(dataset, train_indices)
+        val_dataset = Subset(dataset, val_indices)
+
+        print("Total available windows:", n)
+        print("Training indices:", train_indices)
+        print("Validation indices:", val_indices)
+    
+    elif training_strategy == Training_Strategy.ONE_VISIBILITY_FULL:
+        raw_dataset = train_dataset
+
+        total_windows = len(raw_dataset)
+        split = int(0.8 * total_windows)
+
+        if split == 0 or split == total_windows:
+            raise RuntimeError("Not enough windows for splitting")
+
+        train_dataset = Subset(
+            raw_dataset,
+            range(0, split)
+        )
+
+        val_dataset = Subset(
+            raw_dataset,
+            range(split, total_windows)
+        )
+
+        print("Total windows:", total_windows)
+        print("Training windows:", len(train_dataset))
+        print("Validation windows:", len(val_dataset))
+
+
         
     elif training_strategy!=Training_Strategy.FIVE_FOLD_CROSS:
         raise ValueError("Unknown Strategy or didn't select strategy")
@@ -603,7 +654,11 @@ def train_model(paths,training_strategy):
     output_dir = Path("results") / training_strategy.value.lower()
     output_dir.mkdir(parents=True, exist_ok=True)
 
-    if training_strategy == Training_Strategy.ONE_VISIBILITY:
+    if training_strategy in (
+        Training_Strategy.ONE_VISIBILITY,
+        Training_Strategy.ONE_VISIBILITY_DISTRIBUTED,
+        Training_Strategy.ONE_VISIBILITY_FULL,
+    ):
         if len(paths) != 1:
             raise ValueError("ONE_VISIBILITY requires one observation")
 
@@ -620,6 +675,7 @@ def train_model(paths,training_strategy):
             1, paths, paths, output_dir, device, training_strategy
         )
         return []
+
 
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(SEED)
@@ -920,5 +976,5 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY)
+    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
     
