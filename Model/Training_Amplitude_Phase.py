@@ -350,25 +350,29 @@ def train_one_fold(
             list(range(train_count, train_count + val_count))
         )
 
-    elif training_strategy==Training_Strategy.POOLED_STRATIFIED_SPLIT:
-            train_parts = []
-            val_parts = []
-    
-            for path in train_paths:
-                dataset = makeDataset([path], use_cuda)
-    
-                split = int(0.8 * len(dataset))
-    
-                train_parts.append(
-                    Subset(dataset, range(0, split))
+    elif training_strategy == Training_Strategy.POOLED_STRATIFIED_SPLIT:
+        train_parts = []
+        val_parts = []
+
+        for path in train_paths:
+            dataset = makeDataset([path], use_cuda)
+
+            if len(dataset) < 40:
+                raise RuntimeError(
+                    f"Not enough windows in {path}"
                 )
-    
-                val_parts.append(
-                    Subset(dataset, range(split, len(dataset)))
-                )
-    
-            train_dataset = ConcatDataset(train_parts)
-            val_dataset = ConcatDataset(val_parts)
+
+            train_parts.append(
+                Subset(dataset, range(0, 32))
+            )
+
+            val_parts.append(
+                Subset(dataset, range(32, 40))
+            )
+
+        train_dataset = ConcatDataset(train_parts)
+        val_dataset = ConcatDataset(val_parts)
+        
     elif training_strategy!=Training_Strategy.FIVE_FOLD_CROSS:
         raise ValueError("Unknown Strategy or didn't select strategy")
 
@@ -916,5 +920,5 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    train_model(paths=paths,training_strategy=Training_Strategy.POOLED_STRATIFIED_SPLIT)
+    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY)
     
