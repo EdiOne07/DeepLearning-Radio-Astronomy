@@ -654,13 +654,59 @@ def train_model(paths,training_strategy):
     output_dir = Path("results") / training_strategy.value.lower()
     output_dir.mkdir(parents=True, exist_ok=True)
 
+    torch.manual_seed(SEED)
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
+
+    print("Device:", device)
+    print("Number of observations:", len(paths))
+
+    if training_strategy == Training_Strategy.ONE_VISIBILITY_FULL:
+        if not paths:
+            raise ValueError("No observations provided")
+
+        results = []
+
+        for index, path in enumerate(paths, start=1):
+            observation_name = Path(path).stem
+
+            observation_dir = output_dir / observation_name
+            observation_dir.mkdir(parents=True, exist_ok=True)
+
+            print(f"\nObservation {index}/{len(paths)}: {observation_name}")
+
+            _, history, best_nmse = train_one_fold(
+                fold_number=index,
+                train_paths=[path],
+                val_paths=[path],
+                output_dir=observation_dir,
+                device=device,
+                training_strategy=training_strategy,
+            )
+
+            results.append({
+                "observation": observation_name,
+                "best_nmse": best_nmse,
+                "history": history,
+            })
+
+        print("\nFULL 80/20 TRAINING SUMMARY")
+        for result in results:
+            print(
+                f"{result['observation']}: "
+                f"Best NMSE = {result['best_nmse']:.6f}"
+            )
+
+        return results
+
     if training_strategy in (
         Training_Strategy.ONE_VISIBILITY,
         Training_Strategy.ONE_VISIBILITY_DISTRIBUTED,
-        Training_Strategy.ONE_VISIBILITY_FULL,
     ):
         if len(paths) != 1:
-            raise ValueError("ONE_VISIBILITY requires one observation")
+            raise ValueError(
+                f"{training_strategy.value} requires one observation"
+            )
 
         train_one_fold(
             1, paths, paths, output_dir, device, training_strategy
@@ -676,18 +722,14 @@ def train_model(paths,training_strategy):
         )
         return []
 
-
-    if torch.cuda.is_available():
-        torch.cuda.manual_seed_all(SEED)
-
-    print("Device:", device)
-    print("Number of observations:", len(paths))
+    # Five-fold cross-validation
     if training_strategy != Training_Strategy.FIVE_FOLD_CROSS:
         raise ValueError(f"Unsupported strategy: {training_strategy}")
 
     if len(paths) != 5:
         raise ValueError("Five-fold cross-validation requires five observations")
 
+    # Keep your existing code from here:
     fold_results = []
 
     for val_idx in range(K_FOLDS):
