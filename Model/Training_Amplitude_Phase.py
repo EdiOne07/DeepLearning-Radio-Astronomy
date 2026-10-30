@@ -335,12 +335,6 @@ def train_one_fold(
     train_dataset = makeDataset(train_paths, use_cuda)
     val_dataset = makeDataset(val_paths, use_cuda)
 
-    warmup_loader = DataLoader(
-    Subset(train_dataset, range(32)),
-    batch_size=BATCH_SIZE,
-    shuffle=True,
-    num_workers=2,
-)
     if training_strategy==Training_Strategy.ONE_VISIBILITY:
         raw_dataset = train_dataset
 
@@ -476,6 +470,17 @@ def train_one_fold(
         num_workers=2,
         pin_memory=False,
     )
+
+    warmup_loader = None
+
+    if training_strategy == Training_Strategy.ONE_VISIBILITY_FULL:
+        warmup_loader = DataLoader(
+            Subset(train_dataset, range(min(32, len(train_dataset)))),
+            batch_size=BATCH_SIZE,
+            shuffle=True,
+            num_workers=2,
+            pin_memory=False,
+        )
 
     val_loader = DataLoader(
         val_dataset,
