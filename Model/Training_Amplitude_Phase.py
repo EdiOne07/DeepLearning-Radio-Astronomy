@@ -4,7 +4,7 @@ import glob
 import copy
 from pathlib import Path
 import math
-
+import os
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 
 if str(PROJECT_ROOT) not in sys.path:
@@ -57,6 +57,8 @@ PATCH_SIZE=16
 
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
+LOSS_MODE = os.environ.get("LOSS_MODE", "standardized")
+
 
 class Model_Type(Enum):
     AUTOENCODER_BASE="AUTOENCODER_BASE"
@@ -72,6 +74,44 @@ class Training_Strategy(Enum):
 ###################
 # DATA_HANDLING
 ###################
+
+class PhysicalComplexMSE(nn.Module):
+    """
+    Computes complex reconstruction MSE in original visibility units,
+    up to one fixed global scaling factor.
+
+    Input channels:
+    [P0_real, P0_imag, P1_real, P1_imag,
+     P2_real, P2_imag, P3_real, P3_imag]
+    """
+
+    def __init__(self, standardizer):
+        super().__init__()
+
+        real_std = standardizer.real_std.detach().flatten()
+        imag_std = standardizer.imag_std.detach().flatten()
+
+        if real_std.numel() != 4 or imag_std.numel() != 4:
+            raise ValueError("Expected four polarization standard deviations")
+
+        std = torch.stack(
+            (real_std, imag_std), dim=1
+        ).flatten()
+
+        if not torch.isfinite(std).all() or (std <= 0).any():
+            raise ValueError("Invalid standardization statistics")
+
+        weights = std.square()
+        weights = weights / weights.mean()
+
+        self.register_buffer(
+            "weights",
+            weights.view(1, 8, 1, 1)
+        )
+
+    def forward(self, prediction, target):
+        squared_error = (prediction - target).square()
+        return (squared_error * self.weights).mean()
 
 class TransformDataset(torch.utils.data.Dataset):
     def __init__(self, dataset, transform, standardizer):
@@ -331,6 +371,10 @@ def train_one_fold(
     print("=" * 70)
 
     use_cuda = device.type == "cuda"
+    torch.manual_seed(SEED)
+
+    if torch.cuda.is_available():
+        torch.cuda.manual_seed_all(SEED)
 
     train_dataset = makeDataset(train_paths, use_cuda)
     val_dataset = makeDataset(val_paths, use_cuda)
@@ -471,17 +515,6 @@ def train_one_fold(
         pin_memory=False,
     )
 
-    warmup_loader = None
-
-    if training_strategy == Training_Strategy.ONE_VISIBILITY_FULL:
-        warmup_loader = DataLoader(
-            Subset(train_dataset, range(min(32, len(train_dataset)))),
-            batch_size=BATCH_SIZE,
-            shuffle=True,
-            num_workers=2,
-            pin_memory=False,
-        )
-
     val_loader = DataLoader(
         val_dataset,
         batch_size=BATCH_SIZE,
@@ -492,7 +525,21 @@ def train_one_fold(
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
 
-    criterion = nn.MSELoss()
+
+    if LOSS_MODE == "standardized":
+        criterion = nn.MSELoss()
+
+    elif LOSS_MODE == "physical":
+        criterion = PhysicalComplexMSE(standardizer).to(device)
+
+    else:
+        raise ValueError(f"Unknown loss mode: {LOSS_MODE}")
+
+    print("Loss function:", LOSS_MODE)
+
+    if LOSS_MODE == "physical":
+        print("Physical loss channel weights:", criterion.weights.flatten())
+
 
     optimizer = torch.optim.AdamW(
         model.parameters(),
@@ -515,9 +562,8 @@ def train_one_fold(
 
         total_train_loss = 0.0
         total_train_batches = 0
-        active_loader = warmup_loader if epoch < 15 else train_loader
 
-        for batch in active_loader:
+        for batch in train_loader:
             x = batch.to(device)
 
             if not torch.isfinite(x).all():
@@ -585,6 +631,22 @@ def train_one_fold(
                 device,
                 standardizer,
             )
+        
+        if (epoch + 1) in (1, 5, 10, 20, 30, 40, 50):
+            _, train_nmse, train_snr = validate_model(
+                model,
+                train_loader,
+                criterion,
+                device,
+                standardizer,
+            )
+
+            print(
+                f"Epoch {epoch + 1} | "
+                f"Train NMSE: {train_nmse:.6f} | "
+                f"Train SNR: {train_snr:.2f} dB"
+            )
+
 
         history["train_loss"].append(avg_train_loss)
         history["val_loss"].append(val_loss)
@@ -664,8 +726,11 @@ def train_model(paths,training_strategy):
     paths = sorted(paths)
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
-    output_dir = Path("results") / training_strategy.value.lower()
-    output_dir.mkdir(parents=True, exist_ok=True)
+    output_dir = (
+    Path("results")
+    / training_strategy.value.lower()
+    / LOSS_MODE
+)
 
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -1031,5 +1096,9 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
+    paths = [p for p in paths if "_s41_" in Path(p).name]
+
+    assert len(paths) == 1, f"Expected s41, found: {paths}"
+
     train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
     
