@@ -334,6 +334,13 @@ def train_one_fold(
 
     train_dataset = makeDataset(train_paths, use_cuda)
     val_dataset = makeDataset(val_paths, use_cuda)
+
+    warmup_loader = DataLoader(
+    Subset(train_dataset, range(32)),
+    batch_size=BATCH_SIZE,
+    shuffle=True,
+    num_workers=2,
+)
     if training_strategy==Training_Strategy.ONE_VISIBILITY:
         raw_dataset = train_dataset
 
@@ -503,8 +510,9 @@ def train_one_fold(
 
         total_train_loss = 0.0
         total_train_batches = 0
+        active_loader = warmup_loader if epoch < 15 else train_loader
 
-        for batch in train_loader:
+        for batch in active_loader:
             x = batch.to(device)
 
             if not torch.isfinite(x).all():
