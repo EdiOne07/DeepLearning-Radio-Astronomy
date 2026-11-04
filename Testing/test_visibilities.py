@@ -349,4 +349,11 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
+    data = TimeSlicedVisDataset(paths=paths, window_size=8, target_size=1,
+                                stride=1, pin_memory=False, read_uvw=True)
+    sample = data[10]
+    test_polarization_power(sample)
+    analyze_frequency_polarization_distribution(sample)
+    analyze_visibility_distribution(sample)
+    test_raw_visibility_sample(paths)
     test_raw_visibility_sample(paths)  

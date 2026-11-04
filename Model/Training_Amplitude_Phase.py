@@ -17,7 +17,7 @@ import matplotlib.pyplot as plt
 from torch.utils.data import Subset, ConcatDataset, DataLoader
 
 from Self_Supervising_Loss import MaskedVisibilityLoss
-from Spatial_KFold import SpatialKfoldMask  # Adjust filename capitalization if needed
+from Spatial_KFold import SpatialKfoldMask 
 from rat_stack import TimeSlicedVisDataset
 from Data_Gridding_Patches import UV_Patch_Transform
 from MSE_Loss_Amplitude_Phase import MaskedComplexMSE,polar_to_cartesian
@@ -261,8 +261,10 @@ def compute_reconstruction_metrics(pred, target, standardizer):
         .sum()
         .item()
     )
+    err_pol = (pred_original - target_original).abs().square().sum(dim=(0, 1))
+    pow_pol = target_original.abs().square().sum(dim=(0, 1))
 
-    return error, power
+    return error, power, err_pol,pow_pol
 
 ###################
 # MASKING
@@ -302,6 +304,9 @@ def validate_model(model, val_loader, criterion, device, standardizer):
     total_error = 0.0
     total_power = 0.0
 
+    total_err_pol = torch.zeros(4, dtype=torch.float64)
+    total_pow_pol = torch.zeros(4, dtype=torch.float64)
+
     for batch in val_loader:
         x = batch.to(device)
 
@@ -336,12 +341,14 @@ def validate_model(model, val_loader, criterion, device, standardizer):
         total_loss += loss.item() * x.shape[0]
         total_samples += x.shape[0]
 
-        error, power = compute_reconstruction_metrics(
+        error, power, err_pol,pow_pol= compute_reconstruction_metrics(
             output, x, standardizer
         )
 
         total_error += error
         total_power += power
+        total_err_pol += err_pol.double()
+        total_pow_pol += pow_pol.double()
 
     if total_samples == 0 or total_power <= 0:
         raise RuntimeError("Invalid validation dataset")
@@ -349,8 +356,9 @@ def validate_model(model, val_loader, criterion, device, standardizer):
     val_loss = total_loss / total_samples
     nmse = total_error / total_power
     snr_db = -10.0 * math.log10(nmse) if nmse > 0 else math.inf
+    nmse_pol = total_err_pol / total_pow_pol.clamp_min(1e-30)
 
-    return val_loss, nmse, snr_db
+    return val_loss, nmse, snr_db,nmse_pol
 
 
 ###################
@@ -382,8 +390,8 @@ def train_one_fold(
     if training_strategy==Training_Strategy.ONE_VISIBILITY:
         raw_dataset = train_dataset
 
-        train_count = min(32, len(raw_dataset) - 1)
-        val_count = min(8, len(raw_dataset) - train_count)
+        train_count = min(256, len(raw_dataset) - 1)
+        val_count = min(64, len(raw_dataset) - train_count)
 
         if train_count < 1 or val_count < 1:
             raise RuntimeError("Not enough windows for testing")
@@ -555,6 +563,7 @@ def train_one_fold(
         "val_loss": [],
         "val_nmse": [],
         "val_snr": [],
+        "val_nmse_pol":[],
     }
 
     for epoch in range(EPOCHS):
@@ -624,7 +633,7 @@ def train_one_fold(
             total_train_loss / max(total_train_batches, 1)
         )
 
-        val_loss, val_nmse, val_snr = validate_model(
+        val_loss, val_nmse, val_snr, val_nmse_pol = validate_model(
                 model,
                 val_loader,
                 criterion,
@@ -633,7 +642,7 @@ def train_one_fold(
             )
         
         if (epoch + 1) in (1, 5, 10, 20, 30, 40, 50):
-            _, train_nmse, train_snr = validate_model(
+            _, train_nmse, train_snr, _ = validate_model(
                 model,
                 train_loader,
                 criterion,
@@ -652,13 +661,16 @@ def train_one_fold(
         history["val_loss"].append(val_loss)
         history["val_nmse"].append(val_nmse)
         history["val_snr"].append(val_snr)
+        history["val_nmse_pol"].append(val_nmse_pol.tolist())
 
+        pol_str = " ".join(f"{v:.4f}" for v in val_nmse_pol.tolist())
         print(
             f"Fold {fold_number}/5 | "
             f"Epoch {epoch + 1}/{EPOCHS} | "
             f"Train loss: {avg_train_loss:.6f} | "
             f"Val loss: {val_loss:.6f} | "
             f"Val NMSE: {val_nmse:.6f} | "
+            f"Val NMSE per pol [P0 P1 P2 P3]: {pol_str} | "
             f"Val SNR: {val_snr:.2f} dB"
         )
 
@@ -731,6 +743,7 @@ def train_model(paths,training_strategy):
     / training_strategy.value.lower()
     / LOSS_MODE
 )
+    output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(SEED)
     if torch.cuda.is_available():
@@ -1096,9 +1109,9 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    paths = [p for p in paths if "_s41_" in Path(p).name]
+    paths = [p for p in paths if "_s42_" in Path(p).name]
 
-    assert len(paths) == 1, f"Expected s41, found: {paths}"
+    assert len(paths) == 1, f"Expected s42, found: {paths}"
 
     train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
     
