@@ -1113,5 +1113,5 @@ if __name__ == "__main__":
 
     assert len(paths) == 1, f"Expected s42, found: {paths}"
 
-    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
+    train_model(paths=paths,training_strategy=Training_Strategy.FIVE_FOLD_CROSS)
     
