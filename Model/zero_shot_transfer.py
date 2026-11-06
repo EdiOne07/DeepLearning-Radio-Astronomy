@@ -45,10 +45,10 @@ def refit_standardizer(dataset, n_samples):
     return standardizer
 
 
-def evaluate(model, dataset, indices, standardizer, device):
+def evaluate(model, dataset, indices, standardizer, device,uvw_scale=None):
     loader = DataLoader(
         TransformDataset(Subset(dataset, indices),
-                         PolarizationStandardization(), standardizer),
+                         PolarizationStandardization(), standardizer,uvw_scale),
         batch_size=1, shuffle=False, num_workers=0,
     )
     _, nmse, snr, nmse_pol = validate_model(
@@ -79,6 +79,7 @@ def main():
     model.eval()
 
     source_std = standardizer_from_checkpoint(checkpoint)
+    source_uvw_scale = checkpoint["normalization"].get("uvw_scale")
     print("Checkpoint:", args.checkpoint)
     print("Trained on:", checkpoint.get("train_paths"),
           "| epoch", checkpoint.get("epoch"),
@@ -91,13 +92,23 @@ def main():
         parser.error("No matching observation files")
 
     rows = []
+    reference_uvw=None
     for path in paths:
         name = Path(path).name
         print("\n" + "=" * 70)
         print("Observation:", name)
 
+      
+
         dataset = makeDataset([path], use_cuda=False)
         indices = spread_indices(len(dataset), args.windows)
+        uvw0 = dataset[indices[0]]["uvw"].float()
+        if reference_uvw is None:
+            reference_uvw = uvw0
+        else:
+            print(f"max|UVW - first observation's UVW| = "
+                          f"{(uvw0 - reference_uvw).abs().max().item():.3e}")
+            
         print(f"Windows: {len(dataset)} total, evaluating {len(indices)}")
 
         vis = dataset[indices[0]]["vis"]
@@ -115,7 +126,7 @@ def main():
         for label, standardizer in (("A: source stats", source_std),
                                     ("B: refit stats ", target_std)):
             nmse, snr, nmse_pol = evaluate(
-                model, dataset, indices, standardizer, device
+                model, dataset, indices, standardizer, device, source_uvw_scale
             )
             print(f"{label} | NMSE {nmse:.4f} | SNR {snr:.2f} dB | "
                   f"per pol [P0 P1 P2 P3]: {fmt_pol(nmse_pol)}")

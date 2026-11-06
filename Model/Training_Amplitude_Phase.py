@@ -55,6 +55,15 @@ AMPLITUDE_SCALE=0.1
 WEIGHT_DECAY = 1e-4
 PATCH_SIZE=16
 
+#UVW to tensor approach
+USE_UVW = True
+N_VIS_CHANNELS = 8
+IN_CHANNELS = N_VIS_CHANNELS + 3 if USE_UVW else N_VIS_CHANNELS
+START_MHZ=120
+END_MHZ=170
+MAX_SHIFT = float(os.environ.get("MAX_SHIFT", "0.05"))
+FREQS_HZ = torch.linspace(START_MHZ * 1e6, END_MHZ * 1e6, 64, dtype=torch.float64)
+
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 LOSS_MODE = os.environ.get("LOSS_MODE", "standardized")
@@ -112,16 +121,39 @@ class PhysicalComplexMSE(nn.Module):
     def forward(self, prediction, target):
         squared_error = (prediction - target).square()
         return (squared_error * self.weights).mean()
-
+    
+C = 299_792_458.0
 class TransformDataset(torch.utils.data.Dataset):
-    def __init__(self, dataset, transform, standardizer):
+    def __init__(self, dataset, transform, standardizer,uvw_scale=None,frequencies=None,max_shift=0.0):
         self.dataset=dataset
         self.transform=transform
         self.standardizer=standardizer
+        self.uvw_scale=uvw_scale
+        self.frequencies=frequencies
+        self.max_shift=max_shift
+
+    def phase_shift(self, vis, uvw):
+        l0, m0 = (torch.rand(2, dtype=torch.float64) * 2 - 1) * self.max_shift
+        n0 = torch.sqrt(1 - l0**2 - m0**2)
+        inv_lambda = (self.frequencies / C)[None, :, None]                     
+        u, v, w = (uvw[..., k].double()[:, None, :] * inv_lambda for k in range(3))  
+        phase = -2 * torch.pi * (u * l0 + v * m0 + w * (n0 - 1))
+        rotation = torch.polar(torch.ones_like(phase), phase).to(vis.dtype)
+        return vis * rotation[..., None]
+                    
     def __getitem__(self, index):
         sample = self.dataset[index]
-        normalized = self.standardizer.transform(sample["vis"])
-        return self.transform(normalized).squeeze(0)
+        vis = sample["vis"]
+        if self.max_shift > 0:
+            vis = self.phase_shift(vis, sample["uvw"])
+        normalized = self.standardizer.transform(vis)
+        vis=self.transform(normalized).squeeze(0)
+        if self.uvw_scale is None:
+            return vis
+        uvw = sample["uvw"][0].float() / self.uvw_scale 
+        uvw = uvw.T[:, None, :].expand(3, vis.shape[1], vis.shape[2]) 
+        return torch.cat([vis, uvw], dim=0)
+                   
     def __len__(self):
         return len(self.dataset)
 
@@ -186,8 +218,8 @@ def makeModel(device,model_type:Model_Type):
     if model_type==Model_Type.AUTOENCODER_BASE:
         return Autoencoder.build(
                 dimensions=2,
-                in_channels=8,
-                out_channels=8,
+                in_channels=IN_CHANNELS,
+                out_channels=N_VIS_CHANNELS,
                 latent_dim=16,
                 res_act_fn="silu",
                 res_norm_type="group",
@@ -318,11 +350,12 @@ def validate_model(model, val_loader, criterion, device, standardizer):
 
         output = model(padded)
         output = output[..., :height, :width]
+        target = x[:, :N_VIS_CHANNELS]
 
         if total_samples == 0:
             print(
                 "Validation input power:",
-                x.square().mean().item()
+                target.square().mean().item()
             )
             print(
                 "Validation predicted power:",
@@ -332,17 +365,17 @@ def validate_model(model, val_loader, criterion, device, standardizer):
                 "Validation predicted/input power ratio:",
                 (
                     output.square().sum()
-                    / x.square().sum().clamp_min(1e-12)
+                    / target.square().sum().clamp_min(1e-12)
                 ).item()
             )
 
-        loss = criterion(output, x)
+        loss = criterion(output, target)
 
-        total_loss += loss.item() * x.shape[0]
-        total_samples += x.shape[0]
+        total_loss += loss.item() * target.shape[0]
+        total_samples += target.shape[0]
 
         error, power, err_pol,pow_pol= compute_reconstruction_metrics(
-            output, x, standardizer
+            output, target, standardizer
         )
 
         total_error += error
@@ -370,7 +403,7 @@ def train_one_fold(
     val_paths,
     output_dir,
     device,
-    training_strategy=Training_Strategy.FIVE_FOLD_CROSS
+    training_strategy
 ):
     print("\n" + "=" * 70)
     print(f"FOLD {fold_number}/5")
@@ -492,23 +525,31 @@ def train_one_fold(
             steps=num_stats_samples
         ).long()
 
-    statistics_data = torch.cat(
-            [train_dataset[i]["vis"] for i in indices.tolist()],
-            dim=0
-        )
+    stats_samples = [train_dataset[i] for i in indices.tolist()]
 
+    statistics_data = torch.cat([s["vis"] for s in stats_samples], dim=0)
     standardizer.fit(statistics_data)
     del statistics_data
+
+    uvw_scale = None
+    if USE_UVW:
+        uvw_scale = (
+            torch.cat([s["uvw"] for s in stats_samples], dim=0)
+            .float().abs().amax(dim=(0, 1))   
+            .clamp_min(1e-6)
+        )
+        print("UVW scale:", uvw_scale)
+    del stats_samples
 
 
     channel_transform = PolarizationStandardization()
 
     train_dataset = TransformDataset(
-        train_dataset, channel_transform, standardizer
+        train_dataset, channel_transform, standardizer,uvw_scale,frequencies=FREQS_HZ,max_shift=MAX_SHIFT
     )
 
     val_dataset = TransformDataset(
-        val_dataset, channel_transform, standardizer
+        val_dataset, channel_transform, standardizer,uvw_scale,frequencies=FREQS_HZ,max_shift=0.0
     )
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise RuntimeError(
@@ -591,6 +632,7 @@ def train_one_fold(
 
             outputs = model(x_padded)
             outputs = outputs[..., :height, :width]
+            target = x[:, :N_VIS_CHANNELS]
             if not torch.isfinite(outputs).all():
                 raise RuntimeError(
                     f"Non-finite model output at epoch {epoch + 1}"
@@ -605,7 +647,7 @@ def train_one_fold(
                 print("Output mean:", outputs.mean(dim=(0, 2, 3)))
                 print("Output std:", outputs.std(dim=(0, 2, 3), correction=0))    
 
-            loss = criterion(outputs, x)
+            loss = criterion(outputs, target)
             if not torch.isfinite(loss):
                 raise RuntimeError(
                     f"Non-finite loss at epoch {epoch + 1}: {loss.item()}"
@@ -699,6 +741,7 @@ def train_one_fold(
                     "real_std": standardizer.real_std.cpu(),
                     "imag_mean": standardizer.imag_mean.cpu(),
                     "imag_std": standardizer.imag_std.cpu(),
+                    "uvw_scale": None if uvw_scale is None else uvw_scale.cpu(),
                     },
                 },
                 checkpoint_path,
@@ -739,10 +782,10 @@ def train_model(paths,training_strategy):
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     output_dir = (
-    Path("results")
-    / training_strategy.value.lower()
-    / LOSS_MODE
-)
+        Path("results")
+        / training_strategy.value.lower()
+        / (LOSS_MODE + ("_uvw" if USE_UVW else "_shifting")+(f"_shift{MAX_SHIFT}" if MAX_SHIFT > 0 else ""))
+    )
     output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(SEED)
@@ -1113,5 +1156,5 @@ if __name__ == "__main__":
 
     assert len(paths) == 1, f"Expected s42, found: {paths}"
 
-    train_model(paths=paths,training_strategy=Training_Strategy.FIVE_FOLD_CROSS)
+    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
     
