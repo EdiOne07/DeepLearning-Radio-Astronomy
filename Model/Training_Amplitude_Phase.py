@@ -64,6 +64,9 @@ END_MHZ=170
 MAX_SHIFT = float(os.environ.get("MAX_SHIFT", "0.05"))
 FREQS_HZ = torch.linspace(START_MHZ * 1e6, END_MHZ * 1e6, 64, dtype=torch.float64)
 
+LATENT_DIM = int(os.environ.get("LATENT_DIM", "4"))
+
+VAL_OBS = os.environ.get("VAL_OBS", "s40")
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
 LOSS_MODE = os.environ.get("LOSS_MODE", "standardized")
@@ -79,6 +82,7 @@ class Training_Strategy(Enum):
     ONE_VISIBILITY_DISTRIBUTED = "ONE_VISIBILITY_DISTRIBUTED"
     FIVE_FOLD_CROSS="FIVE_FOLD_CROSS"
     POOLED_STRATIFIED_SPLIT="POOLED_STRATIFIED_SPLIT"
+    LEAVE_ONE_OUT="LEAVE_ONE_OUT"
 
 ###################
 # DATA_HANDLING
@@ -157,6 +161,12 @@ class TransformDataset(torch.utils.data.Dataset):
     def __len__(self):
         return len(self.dataset)
 
+def to_baselines(x):
+    return x[0].permute(2, 0, 1).contiguous()
+
+def to_slice(t):
+    return t.permute(1, 2, 0).unsqueeze(0)
+
 def makeDataset(paths:list[str],use_cuda):
     dataset=TimeSlicedVisDataset(
         paths=paths,
@@ -217,10 +227,10 @@ def makeDataset(paths:list[str],use_cuda):
 def makeModel(device,model_type:Model_Type):
     if model_type==Model_Type.AUTOENCODER_BASE:
         return Autoencoder.build(
-                dimensions=2,
+                dimensions=1,
                 in_channels=IN_CHANNELS,
                 out_channels=N_VIS_CHANNELS,
-                latent_dim=16,
+                latent_dim=LATENT_DIM,
                 res_act_fn="silu",
                 res_norm_type="group",
                 encoder_args={
@@ -340,16 +350,9 @@ def validate_model(model, val_loader, criterion, device, standardizer):
     total_pow_pol = torch.zeros(4, dtype=torch.float64)
 
     for batch in val_loader:
-        x = batch.to(device)
+        x = to_baselines(batch.to(device))     
 
-        height, width = x.shape[-2:]
-        pad_h = (-height) % 4
-        pad_w = (-width) % 4
-
-        padded = F.pad(x, (0, pad_w, 0, pad_h))
-
-        output = model(padded)
-        output = output[..., :height, :width]
+        output = model(x)                      
         target = x[:, :N_VIS_CHANNELS]
 
         if total_samples == 0:
@@ -371,11 +374,11 @@ def validate_model(model, val_loader, criterion, device, standardizer):
 
         loss = criterion(output, target)
 
-        total_loss += loss.item() * target.shape[0]
-        total_samples += target.shape[0]
+        total_loss += loss.item()            
+        total_samples += 1                      
 
-        error, power, err_pol,pow_pol= compute_reconstruction_metrics(
-            output, target, standardizer
+        error, power, err_pol, pow_pol = compute_reconstruction_metrics(
+            to_slice(output), to_slice(target), standardizer
         )
 
         total_error += error
@@ -510,7 +513,8 @@ def train_one_fold(
 
 
         
-    elif training_strategy!=Training_Strategy.FIVE_FOLD_CROSS:
+    elif training_strategy not in (Training_Strategy.FIVE_FOLD_CROSS,
+                                   Training_Strategy.LEAVE_ONE_OUT):
         raise ValueError("Unknown Strategy or didn't select strategy")
 
 
@@ -541,6 +545,17 @@ def train_one_fold(
         print("UVW scale:", uvw_scale)
     del stats_samples
 
+    val_standardizer = standardizer
+    if training_strategy == Training_Strategy.LEAVE_ONE_OUT:
+        val_indices = torch.linspace(
+            0, len(val_dataset) - 1, steps=min(32, len(val_dataset))
+        ).long().tolist()
+        val_standardizer = VisibilityStandardizer()
+        val_standardizer.fit(
+            torch.cat([val_dataset[i]["vis"] for i in val_indices], dim=0)
+        )
+        print("Validation std / training std (real):",
+              (val_standardizer.real_std / standardizer.real_std).tolist())
 
     channel_transform = PolarizationStandardization()
 
@@ -549,7 +564,7 @@ def train_one_fold(
     )
 
     val_dataset = TransformDataset(
-        val_dataset, channel_transform, standardizer,uvw_scale,frequencies=FREQS_HZ,max_shift=0.0
+        val_dataset, channel_transform, val_standardizer, uvw_scale, frequencies=FREQS_HZ, max_shift=0.0
     )
     if len(train_dataset) == 0 or len(val_dataset) == 0:
         raise RuntimeError(
@@ -573,6 +588,14 @@ def train_one_fold(
     )
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
+
+    with torch.no_grad():
+        latent = model.encode(torch.zeros(1, IN_CHANNELS, 64, device=device))
+    print(
+        f"Latent per baseline: {tuple(latent.shape[1:])} | "
+        f"compression {N_VIS_CHANNELS * 64 / latent[0].numel():.1f}x | "
+        f"parameters: {sum(p.numel() for p in model.parameters()):,}"
+    )
 
 
     if LOSS_MODE == "standardized":
@@ -614,24 +637,15 @@ def train_one_fold(
         total_train_batches = 0
 
         for batch in train_loader:
-            x = batch.to(device)
+            
+            x = to_baselines(batch.to(device))   
 
             if not torch.isfinite(x).all():
-                raise RuntimeError(
-                    f"Non-finite input at epoch {epoch + 1}"
-                )
-
-            height, width = x.shape[-2:]
-
-            pad_h = (-height) % 4
-            pad_w = (-width) % 4
-
-            x_padded = F.pad(x, (0, pad_w, 0, pad_h))
+                raise RuntimeError(f"Non-finite input at epoch {epoch + 1}")
 
             optimizer.zero_grad()
 
-            outputs = model(x_padded)
-            outputs = outputs[..., :height, :width]
+            outputs = model(x)                     
             target = x[:, :N_VIS_CHANNELS]
             if not torch.isfinite(outputs).all():
                 raise RuntimeError(
@@ -639,13 +653,13 @@ def train_one_fold(
                 )
             
             if epoch == 0 and total_train_batches == 0:
-                print("Input mean:", x.mean(dim=(0, 2, 3)))
-                print("Input std:", x.std(dim=(0, 2, 3), correction=0))
+                print("Input shape:", tuple(x.shape))
+                print("Input mean:", x.mean(dim=(0, 2)))
+                print("Input std:", x.std(dim=(0, 2), correction=0))
                 print("Input min:", x.min().item())
                 print("Input max:", x.max().item())
-                print("Input std:", x.std().item())
-                print("Output mean:", outputs.mean(dim=(0, 2, 3)))
-                print("Output std:", outputs.std(dim=(0, 2, 3), correction=0))    
+                print("Output mean:", outputs.mean(dim=(0, 2)))
+                print("Output std:", outputs.std(dim=(0, 2), correction=0))  
 
             loss = criterion(outputs, target)
             if not torch.isfinite(loss):
@@ -676,11 +690,7 @@ def train_one_fold(
         )
 
         val_loss, val_nmse, val_snr, val_nmse_pol = validate_model(
-                model,
-                val_loader,
-                criterion,
-                device,
-                standardizer,
+                model, val_loader, criterion, device, val_standardizer,
             )
         
         if (epoch + 1) in (1, 5, 10, 20, 30, 40, 50):
@@ -784,8 +794,12 @@ def train_model(paths,training_strategy):
     output_dir = (
         Path("results")
         / training_strategy.value.lower()
-        / (LOSS_MODE + ("_uvw" if USE_UVW else "_shifting")+(f"_shift{MAX_SHIFT}" if MAX_SHIFT > 0 else ""))
+        / (LOSS_MODE
+           + f"_perbaseline_lat{LATENT_DIM}"
+           + ("_uvw" if USE_UVW else "")
+           + (f"_shift{MAX_SHIFT}" if MAX_SHIFT > 0 else ""))
     )
+
     output_dir.mkdir(parents=True, exist_ok=True)
 
     torch.manual_seed(SEED)
@@ -855,7 +869,23 @@ def train_model(paths,training_strategy):
             1, paths, paths, output_dir, device, training_strategy
         )
         return []
-
+    
+    if training_strategy == Training_Strategy.LEAVE_ONE_OUT:
+        val_paths = [p for p in paths if f"_{VAL_OBS}_" in Path(p).name]
+        train_paths = [p for p in paths if p not in val_paths]
+        if len(val_paths) != 1 or len(train_paths) < 1:
+            raise ValueError(
+                f"LEAVE_ONE_OUT: VAL_OBS={VAL_OBS} must match exactly one file; "
+                f"validation {val_paths}, training {train_paths}"
+            )
+        print(f"Holding out {VAL_OBS}; training on {len(train_paths)} observation(s)")
+        fold_dir = output_dir / VAL_OBS
+        fold_dir.mkdir(parents=True, exist_ok=True)
+        _, history, best_nmse = train_one_fold(
+            1, train_paths, val_paths, fold_dir, device, training_strategy
+        )
+        return [{"validation_path": val_paths[0], "best_nmse": best_nmse, "history": history}]
+    
     # Five-fold cross-validation
     if training_strategy != Training_Strategy.FIVE_FOLD_CROSS:
         raise ValueError(f"Unsupported strategy: {training_strategy}")
@@ -1152,9 +1182,6 @@ if __name__ == "__main__":
         for p in (glob.glob(arg) or [arg])
         if Path(p).is_file()
     })
-    paths = [p for p in paths if "_s42_" in Path(p).name]
-
-    assert len(paths) == 1, f"Expected s42, found: {paths}"
-
-    train_model(paths=paths,training_strategy=Training_Strategy.ONE_VISIBILITY_FULL)
+    assert len(paths) >= 2, f"Expected the training observations plus {VAL_OBS}, found: {paths}"
+    train_model(paths=paths, training_strategy=Training_Strategy.LEAVE_ONE_OUT)
     
