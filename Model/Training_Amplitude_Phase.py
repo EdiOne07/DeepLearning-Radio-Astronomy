@@ -69,7 +69,7 @@ LATENT_DIM = int(os.environ.get("LATENT_DIM", "4"))
 VAL_OBS = os.environ.get("VAL_OBS", "s40")
 use_cuda = torch.cuda.is_available()
 device = torch.device("cuda" if use_cuda else "cpu")
-LOSS_MODE = os.environ.get("LOSS_MODE", "standardized")
+LOSS_MODE = os.environ.get("LOSS_MODE", "physical")
 
 
 class Model_Type(Enum):
@@ -119,7 +119,7 @@ class PhysicalComplexMSE(nn.Module):
 
         self.register_buffer(
             "weights",
-            weights.view(1, 8, 1, 1)
+            weights.view(1, 8, 1) #was 1,8,1,1
         )
 
     def forward(self, prediction, target):
