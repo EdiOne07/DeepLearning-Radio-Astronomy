@@ -19,13 +19,13 @@ from torch.utils.data import Subset, ConcatDataset, DataLoader
 from Self_Supervising_Loss import MaskedVisibilityLoss
 from Spatial_KFold import SpatialKfoldMask 
 from rat_stack import TimeSlicedVisDataset
-from Data_Gridding_Patches import UV_Patch_Transform
 from MSE_Loss_Amplitude_Phase import MaskedComplexMSE,polar_to_cartesian
 from Data_Loading_and_Vizualization.ReconstructVisualization import visualize_reconstruction
 from enum import Enum
 from Visibility_Standerdizer import VisibilityStandardizer
 from Polarization_Standardization import PolarizationStandardization
 import torch.nn.functional as F
+import optuna
 
 chuchichaestli_src = Path(
     "/home/edione/Projects/chuchichaestli/src"
@@ -44,16 +44,12 @@ STRIDE=8
 BATCH_SIZE=1
 EPOCHS=50
 LEARNING_RATE=1e-4
-LAMBDA_SMOOTHNESS=1e-6
 K_FOLDS=5
-GRID_SIZE=8192
 MAX_UV=70000
-BLOCK_SIZE = 32
 HOLDOUT_RATIO = 0.20
 SEED=42
 AMPLITUDE_SCALE=0.1
 WEIGHT_DECAY = 1e-4
-PATCH_SIZE=16
 
 #UVW to tensor approach
 USE_UVW = True
@@ -73,9 +69,10 @@ LOSS_MODE = os.environ.get("LOSS_MODE", "physical")
 
 
 class Model_Type(Enum):
-    AUTOENCODER_BASE="AUTOENCODER_BASE"
-    FUTURE_AUTOENCODER="FUTURE_AUTOENCODER"
-
+    AUTOENCODER_BASE="AUTOENCODER_BASE" # Compression of 8
+    AUTOENCODER_COMPRESSION_4="AUTOENCODER_COMPRESSION_4"
+    AUTOENCODER_COMPRESSION_16="AUTOENCODER_COMPRESSION_16"
+    AUTOENCODER_COMPRESSION_32="AUTOENCODER_COMPRESSION_32"
 class Training_Strategy(Enum):
     ONE_VISIBILITY="ONE_VISIBILITY"
     ONE_VISIBILITY_FULL = "ONE_VISIBILITY_FULL"
@@ -180,51 +177,8 @@ def makeDataset(paths:list[str],use_cuda):
 ###################
 # MODEL
 ###################
-
-#This wrapper was designed to handle some compression mechanism, but right now it is not useful. Need to fix baseline first
-#class PatchAutoencoder(nn.Module):
-   # def __init__(self, latent_size=512):
-       # super().__init__()
-        #self.feature_projection = nn.Linear(66, 64)
-
-        #self.latent_queries = nn.Parameter(
-          #  torch.randn(8, 1, 64) * 0.02
-        #)
-
-        #self.attention = nn.MultiheadAttention(
-           # embed_dim=64,
-           # num_heads=4,
-           # batch_first=True
-        #)
-
-        #self.autoencoder = Autoencoder.build(
-          #  dimensions=2,
-           # in_channels=3,
-            #out_channels=2,
-            #latent_dim=16,
-            #res_act_fn="silu",
-           # res_norm_type="group",
-           # encoder_args={"n_channels": 16},
-       # )
-
-        #self.latent_size = latent_size
-
-    #def encode_patches(self, patches,patch_positions):
-        #encoder=self.autoencoder.encode(patches)
-        #flattened_patches=encoder.flatten(start_dim=1)
-        #patch_positions_normalized = (
-           # patch_positions.to(
-              #  device=flattened_patches.device,
-                #dtype=flattened_patches.dtype,
-           # ) / 511.0
-       # )
-    
-        #final_encoding=torch.cat((flattened_patches,patch_positions_normalized),dim=1)
-        #return final_encoding
-    #
-
 #Model Builder
-def makeModel(device,model_type:Model_Type):
+def makeModel(device,model_type:Model_Type,kernel_size=3,n_channels=16):
     if model_type==Model_Type.AUTOENCODER_BASE:
         return Autoencoder.build(
                 dimensions=1,
@@ -233,8 +187,9 @@ def makeModel(device,model_type:Model_Type):
                 latent_dim=LATENT_DIM,
                 res_act_fn="silu",
                 res_norm_type="group",
+                res_kernel_size=kernel_size,
                 encoder_args={
-                    "n_channels": 16,
+                    "n_channels": n_channels,
                     "down_block_types": (
                         "AutoencoderDownBlock",
                         "AutoencoderDownBlock",
@@ -253,9 +208,94 @@ def makeModel(device,model_type:Model_Type):
                     "num_layers_per_block": 1,
                 },
             ).to(device)
-    elif model_type==Model_Type.FUTURE_AUTOENCODER:
-        # tbd
-        return 0
+    elif model_type==Model_Type.AUTOENCODER_COMPRESSION_4:
+           return Autoencoder.build(
+                        dimensions=1,
+                        in_channels=IN_CHANNELS,
+                        out_channels=N_VIS_CHANNELS,
+                        latent_dim=LATENT_DIM+4,
+                        res_act_fn="silu",
+                        res_norm_type="group",
+                        kernel_size=kernel_size,
+                        encoder_args={
+                            "n_channels": n_channels,
+                            "down_block_types": (
+                                "AutoencoderDownBlock",
+                                "AutoencoderDownBlock",
+                                "AttnAutoencoderDownBlock",
+                            ),
+                            "block_out_channel_mults": (1, 2, 2),
+                            "num_layers_per_block": 1,
+                        },
+                        decoder_args={
+                            "up_block_types": (
+                                "AttnAutoencoderUpBlock",
+                                "AutoencoderUpBlock",
+                                "AutoencoderUpBlock",
+                            ),
+                            "block_out_channel_mults": (1, 2, 2),
+                            "num_layers_per_block": 1,
+                        },
+                    ).to(device)
+    elif model_type==Model_Type.AUTOENCODER_COMPRESSION_16:
+               return Autoencoder.build(
+                            dimensions=1,
+                            in_channels=IN_CHANNELS,
+                            out_channels=N_VIS_CHANNELS,
+                            latent_dim=LATENT_DIM-2,
+                            res_act_fn="silu",
+                            res_norm_type="group",
+                            kernel_size=kernel_size,
+                            encoder_args={
+                                "n_channels": n_channels,
+                                "down_block_types": (
+                                    "AutoencoderDownBlock",
+                                    "AutoencoderDownBlock",
+                                    "AttnAutoencoderDownBlock",
+                                ),
+                                "block_out_channel_mults": (1, 2, 2),
+                                "num_layers_per_block": 1,
+                            },
+                            decoder_args={
+                                "up_block_types": (
+                                    "AttnAutoencoderUpBlock",
+                                    "AutoencoderUpBlock",
+                                    "AutoencoderUpBlock",
+                                ),
+                                "block_out_channel_mults": (1, 2, 2),
+                                "num_layers_per_block": 1,
+                            },
+                        ).to(device)
+    elif model_type==Model_Type.AUTOENCODER_COMPRESSION_32:
+               return Autoencoder.build(
+                            dimensions=1,
+                            in_channels=IN_CHANNELS,
+                            out_channels=N_VIS_CHANNELS,
+                            latent_dim=LATENT_DIM-3,
+                            res_act_fn="silu",
+                            res_norm_type="group",
+                            kernel_size=kernel_size,
+                            encoder_args={
+                                "n_channels": n_channels,
+                                "down_block_types": (
+                                    "AutoencoderDownBlock",
+                                    "AutoencoderDownBlock",
+                                    "AttnAutoencoderDownBlock",
+                                ),
+                                "block_out_channel_mults": (1, 2, 2),
+                                "num_layers_per_block": 1,
+                            },
+                            decoder_args={
+                                "up_block_types": (
+                                    "AttnAutoencoderUpBlock",
+                                    "AutoencoderUpBlock",
+                                    "AutoencoderUpBlock",
+                                ),
+                                "block_out_channel_mults": (1, 2, 2),
+                                "num_layers_per_block": 1,
+                            },
+                        ).to(device)
+    return 0
 
 ###################
 # METRICS
@@ -307,30 +347,6 @@ def compute_reconstruction_metrics(pred, target, standardizer):
     pow_pol = target_original.abs().square().sum(dim=(0, 1))
 
     return error, power, err_pol,pow_pol
-
-###################
-# MASKING
-###################
-def make_spatial_masker():
-    return SpatialKfoldMask(
-        grid_size=GRID_SIZE,
-        block_size=BLOCK_SIZE,
-        split_ratio=HOLDOUT_RATIO,
-    )
-
-def make_model_and_input_target(grid,heldout_mask):
-    original_mask=grid[:,2:3,:,:]
-    context_mask=original_mask.clone()
-    context_mask[heldout_mask>0]=0.0
-
-    model_input=grid.clone()
-    model_input[:,0:2,:,:]*=context_mask
-    model_input[:,2:3,:,:]=context_mask
-
-    loss_target=grid.clone()
-    loss_target[:,2:3,:,:]=heldout_mask
-
-    return model_input, loss_target, context_mask
 
 ###################
 # EVALUATION
@@ -756,24 +772,9 @@ def train_one_fold(
                 },
                 checkpoint_path,
             )
-        #diagnose_reconstruction(
-                       # model,
-                        #train_loader,
-                        #device,
-                        #transform.amplitude_scale,
-                    #)
     
     if best_state is not None:
         model.load_state_dict(best_state)
-        #visualize_reconstruction(
-         #   model=model,
-          #  dataset=val_dataset,
-           # device=device,
-           # amplitude_scale=transform.amplitude_scale,
-            #output_dir=output_dir,
-            #fold_number=fold_number,
-            #sample_index=0,
-        #)
 
     print(
         f"\nFold {fold_number} best NMSE: {best_nmse:.6f}"
