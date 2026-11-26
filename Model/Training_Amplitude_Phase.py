@@ -596,6 +596,7 @@ def train_one_fold(
         shuffle=True,
         num_workers=2,
         pin_memory=False,
+        multiprocessing_context="fork",
     )
 
     val_loader = DataLoader(
@@ -604,6 +605,7 @@ def train_one_fold(
         shuffle=False,
         num_workers=2,
         pin_memory=False,
+        multiprocessing_context="fork",
     )
 
     model = makeModel(device,Model_Type.AUTOENCODER_BASE)
