@@ -25,7 +25,10 @@ from enum import Enum
 from Visibility_Standerdizer import VisibilityStandardizer
 from Polarization_Standardization import PolarizationStandardization
 import torch.nn.functional as F
-import optuna
+try:
+    import optuna
+except ImportError:
+    optuna=None
 
 chuchichaestli_src = Path(
     "/home/edione/Projects/chuchichaestli/src"
